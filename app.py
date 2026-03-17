@@ -65,9 +65,6 @@ def check_password():
     if "authenticated" not in st.session_state:
         st.session_state.authenticated = False
     
-    if st.session_state.authenticated:
-        return True
-    
     def login():
         entered_password = st.session_state.password_input
         if entered_password == st.secrets.get("PASSWORD", ""):
