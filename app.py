@@ -200,6 +200,7 @@ with st.sidebar:
         model_choice = st.selectbox("Select Model", [
             "anthropic/claude-3.5-sonnet",
             "anthropic/claude-3-5-haiku",
+            "openrouter/hunter-alpha",
             "meta-llama/llama-3.1-70b-instruct",
             "google/gemini-pro-1.5",
             "mistralai/mixtral-8x22b-instruct"
@@ -208,6 +209,7 @@ with st.sidebar:
     elif provider_choice == "OpenRouter (Free)":
         model_choice = st.selectbox("Select Free Model", [
             "deepseek/deepseek-r1:free",
+            "openrouter/hunter-alpha",
             "google/gemini-pro-1.5:free",
             "meta-llama/llama-3.1-8b-instruct:free",
             "mistralai/mistral-nemo:free"
