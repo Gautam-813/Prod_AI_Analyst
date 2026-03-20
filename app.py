@@ -281,6 +281,71 @@ with st.sidebar:
         st.session_state.messages = []
         st.rerun()
 
+    # ── Live Data Sync Panel ─────────────────────────────────────────────
+    st.markdown("---")
+    st.subheader("📡 Live Data Sync")
+    st.caption("Connect your local MT5 server to pull only the missing candles.")
+
+    mt5_url = st.text_input("MT5 Server URL",
+                             value=st.session_state.get("mt5_url", "http://localhost:5000"),
+                             key="mt5_url_input",
+                             placeholder="http://localhost:5000")
+
+    if st.button("🔌 Test MT5 Connection", use_container_width=True):
+        from data_sync import ping_mt5_server
+        result = ping_mt5_server(mt5_url)
+        if result["reachable"] and result["mt5_initialized"]:
+            st.success("✅ MT5 Server Connected & Ready")
+            st.session_state.mt5_url = mt5_url
+        elif result["reachable"]:
+            st.warning("⚠️ Server running but MT5 not initialized yet")
+        else:
+            st.error("❌ Cannot reach server. Is mt5_data_server.py running?")
+
+    st.markdown("---")
+
+    # Per-symbol sync buttons
+    hf_repo  = st.secrets.get("HF_REPO_ID", "")
+    hf_token = st.secrets.get("HF_TOKEN", "")
+
+    for sym in ["XAUUSD", "EURUSD"]:
+        col_label, col_btn = st.columns([3, 2])
+        with col_label:
+            # Show data freshness if parquet is loaded
+            if f"df_{sym}" in st.session_state:
+                from data_sync import get_gap_info
+                try:
+                    gap = get_gap_info(st.session_state[f"df_{sym}"])
+                    if gap["is_fresh"]:
+                        st.caption(f"🟢 {sym} — Fresh")
+                    elif gap["gap_hours"] < 24:
+                        st.caption(f"🟡 {sym} — {gap['label']}")
+                    else:
+                        st.caption(f"🔴 {sym} — {gap['label']}")
+                except:
+                    st.caption(f"📊 {sym}")
+            else:
+                st.caption(f"📊 {sym} — not loaded")
+
+        with col_btn:
+            if st.button(f"🔄 Sync", key=f"sync_{sym}", use_container_width=True):
+                if not hf_repo or not hf_token:
+                    st.error("HF_REPO_ID or HF_TOKEN missing from secrets.toml")
+                elif not mt5_url:
+                    st.error("Enter MT5 server URL first")
+                else:
+                    from data_sync import sync_symbol
+                    with st.spinner(f"Syncing {sym}…"):
+                        try:
+                            updated_df, stats = sync_symbol(hf_repo, sym, hf_token, mt5_url)
+                            st.session_state[f"df_{sym}"] = updated_df
+                            if stats["status"] == "already_fresh":
+                                st.success(f"✅ {sym} already up to date")
+                            else:
+                                st.success(f"✅ {sym}: +{stats['new_rows']} rows synced")
+                        except Exception as e:
+                            st.error(f"❌ {sym} sync failed: {e}")
+
 # Arrow-safe display helper (fixes PyArrow serialization errors)
 def make_arrow_safe(df):
     """Convert DataFrame to Arrow-compatible types for Streamlit display."""

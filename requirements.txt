@@ -19,3 +19,4 @@ duckdb
 polars
 altair
 xgboost
+huggingface_hub
