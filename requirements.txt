@@ -20,3 +20,4 @@ polars
 altair
 xgboost
 huggingface_hub
+streamlit-autorefresh

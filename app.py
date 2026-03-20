@@ -25,6 +25,7 @@ import quantstats as qs
 import duckdb
 import polars as pl
 import xgboost as xgb
+from streamlit_autorefresh import st_autorefresh
 
 # Lazy/Optional Heavy Imports
 try:
@@ -306,7 +307,7 @@ with st.sidebar:
 
     # Per-symbol sync buttons
     hf_repo  = st.secrets.get("HF_REPO_ID", "")
-    hf_token = st.secrets.get("HF_TOKEN", "")
+    hf_token = st.secrets.get("HuggingFace_API_KEY", "")
 
     for sym in ["XAUUSD", "EURUSD"]:
         col_label, col_btn = st.columns([3, 2])
@@ -345,6 +346,31 @@ with st.sidebar:
                                 st.success(f"✅ {sym}: +{stats['new_rows']} rows synced")
                         except Exception as e:
                             st.error(f"❌ {sym} sync failed: {e}")
+
+    # --- ⚡ AUTO-SYNC CONTROLLER ---
+    st.markdown("---")
+    st.subheader("⚡ Auto-Sync Mode")
+    auto_sync_on = st.toggle("Enable Auto-Sync 📡", value=st.session_state.get("auto_sync_on", False))
+    st.session_state.auto_sync_on = auto_sync_on
+
+    if auto_sync_on:
+        sync_interval = st.selectbox("Frequency ⏱️", [1, 5, 15, 30, 60], index=2, format_func=lambda x: f"Every {x} min")
+        
+        # This invisible component triggers a rerun every X minutes
+        refresh_count = st_autorefresh(interval=sync_interval * 60 * 1000, key="sync_counter")
+        
+        # Perform sync if refresh triggered
+        if refresh_count > 0:
+            # Sync only the symbol the user is currently looking at to save bandwidth
+            current_sym = st.session_state.get("current_symbol_view", "XAUUSD")
+            if hf_repo and hf_token and mt5_url:
+                from data_sync import sync_symbol
+                try:
+                    updated_df, stats = sync_symbol(hf_repo, current_sym, hf_token, mt5_url)
+                    st.session_state[f"df_{current_sym}"] = updated_df
+                    st.toast(f"🔄 Auto-Synced {current_sym} ({stats.get('new_rows', 0)} new candles)")
+                except Exception as e:
+                    st.toast(f"🚨 Auto-Sync failed for {current_sym}")
 
 # Arrow-safe display helper (fixes PyArrow serialization errors)
 def make_arrow_safe(df):
@@ -477,6 +503,17 @@ with colA:
     )
 with colB:
     if st.button(f"🚀 Load {symbol_choice} Data", use_container_width=True):
+        st.session_state.current_symbol_view = symbol_choice
+        
+        # Priority 1: Check if we have synced data in the session state
+        if f"df_{symbol_choice}" in st.session_state:
+            st.session_state.df = st.session_state[f"df_{symbol_choice}"]
+            st.session_state.file_name = f"Synced_{symbol_choice}_Data"
+            st.success(f"Loaded {symbol_choice} from Live Sync Hub!")
+            st.session_state.messages = []
+            st.rerun()
+        
+        # Priority 2: Check for local parquet file
         import os
         filename = f"{symbol_choice}_M1_Data.parquet"
         if os.path.exists(filename):
@@ -486,7 +523,22 @@ with colB:
                 st.session_state.messages = []
                 st.rerun()
         else:
-            st.error(f"Server dataset '{filename}' not found!")
+            # Priority 3: Try to pull from HF Hub if nothing local exists
+            if hf_repo and hf_token:
+                from data_sync import load_from_hf
+                with st.spinner(f"📥 Fetching {symbol_choice} from HF Hub..."):
+                    try:
+                        hub_df = load_from_hf(hf_repo, symbol_choice, hf_token)
+                        st.session_state.df = hub_df
+                        st.session_state[f"df_{symbol_choice}"] = hub_df
+                        st.session_state.file_name = f"Hub_{symbol_choice}_Data"
+                        st.success(f"Dataset retrieved from Hub!")
+                        st.session_state.messages = []
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Cloud dataset not found and local file missing!")
+            else:
+                st.error(f"Missing local file and cloud credentials!")
 
 with colC:
     if st.button("🧹 Clear Dataset", use_container_width=True):
