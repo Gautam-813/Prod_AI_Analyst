@@ -1,46 +1,22 @@
-# Streamlit secrets (never commit API keys or passwords)
-.streamlit/secrets.toml
 
-# User's specific ignores
-ea/
-added_impulse_analysis19-03-26.zip
-ma_impulse_data_oldafterold.csv
-ma_impulse_data.csv
-MA_Impulse_Logger_backup_multipleaiadded.zip
-
-# Parquet Data files (ignored by default to keep repo clean)
-*.parquet
-
-# Data files (can be regenerated)
-*.csv
-
-# Python cache
+# Streamlit & Python
 __pycache__/
-*.py[cod]
-*$py.class
-*.so
+*.pyc
+.streamlit/config.toml
+secrets.toml
 
-# Virtual environments
-venv/
-env/
-.venv/
+# Executables & Builds (Too big for GitHub)
+dist/
+build/
+*.exe
+*.pkg
+*.spec
 
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-
-# OS files
-.DS_Store
-Thumbs.db
-
-# Jupyter Notebook
-.ipynb_checkpoints
-
-# pytest
-.pytest_cache/
-
-# Coverage
-htmlcov/
-.coverage
+# Large Data & Archives
+*.parquet
+*.zip
+*.csv
+sync_log.txt
+final_sync_log.txt
+archive/
+temp_yh/

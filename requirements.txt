@@ -21,3 +21,6 @@ altair
 xgboost
 huggingface_hub
 streamlit-autorefresh
+yfinance
+ccxt
+toml

@@ -8,6 +8,7 @@ import tempfile
 import pytz
 import requests
 import pandas as pd
+import yfinance as yf
 from datetime import datetime, timezone
 
 # -----------------------------------------------------------------------
@@ -214,3 +215,117 @@ def ping_mt5_server(server_url: str, mt5_token: str = "") -> dict:
         }
     except:
         return {"reachable": False, "mt5_initialized": False}
+
+# -----------------------------------------------------------------------
+# 8. Sync from Yahoo Finance (Global Markets)
+# -----------------------------------------------------------------------
+def get_gap_info(df):
+    """
+    Calculates the gap between the last candle in the dataframe and now.
+    """
+    if df is None or df.empty:
+        return {"gap_hours": 0, "label": "No Data"}
+    
+    try:
+        # Convert 'time' to datetime if it isn't already
+        last_time = pd.to_datetime(df['time'].iloc[-1])
+        now = datetime.now()
+        diff = now - last_time
+        gap_hours = diff.total_seconds() / 3600
+        
+        if gap_hours < 1: label = "Up to date"
+        elif gap_hours < 24: label = f"{int(gap_hours)} hours"
+        else: label = f"{int(gap_hours/24)} days"
+        
+        return {"gap_hours": gap_hours, "label": label, "last_time": last_time}
+    except Exception as e:
+        print(f"Gap check error: {e}")
+        return {"gap_hours": 0, "label": "Error checking"}
+def sync_yahoo_symbol(repo_id: str, symbol: str, hf_token: str, 
+                      period="max", interval="1d") -> tuple[pd.DataFrame, dict]:
+    """
+    Pulls data from yfinance, merges with Hub, and pushes back.
+    Automatically creates a filename like 'NVDA_1d_Data.parquet'.
+    """
+    print(f"🔄 Syncing {symbol} from Yahoo Finance...")
+    from huggingface_hub import upload_file
+
+    def _yf_filename(s: str, i: str) -> str:
+        return f"{s}_{i}_Data.parquet"
+
+    # Step 1 — Fetch new data from Yahoo
+    try:
+        ticker = yf.Ticker(symbol)
+        # Fetching 'period' (e.g. 5y, max, 1mo)
+        new_df = ticker.history(period=period, interval=interval)
+        
+        if new_df.empty:
+            raise ValueError(f"No data returned for ticker {symbol}")
+
+        # Standardize index and columns
+        new_df = new_df.reset_index()
+        # Ensure time column is renamed to standard lowercase 'time'
+        time_col = next((c for c in new_df.columns if c.lower() in ("date", "datetime")), new_df.columns[0])
+        new_df = new_df.rename(columns={
+            time_col: 'time',
+            'Open': 'open',
+            'High': 'high',
+            'Low': 'low',
+            'Close': 'close',
+            'Volume': 'tick_volume',
+            'Dividends': 'dividends',
+            'Stock Splits': 'splits'
+        })
+        new_df['time'] = pd.to_datetime(new_df['time'], utc=True)
+        # Lowercase any other remaining columns
+        new_df.columns = [c.lower() for c in new_df.columns]
+
+    except Exception as e:
+        raise RuntimeError(f"[Yahoo Fetch] Failed: {e}")
+
+    # Step 2 — Attempt to Merge with existing Cloud Hub data
+    try:
+        from huggingface_hub import hf_hub_download
+        local_cache = hf_hub_download(
+            repo_id=repo_id,
+            filename=_yf_filename(symbol, interval),
+            repo_type="dataset",
+            token=hf_token
+        )
+        existing_df = pd.read_parquet(local_cache)
+        existing_df['time'] = pd.to_datetime(existing_df['time'], utc=True)
+        
+        # Merge, dedup, sort
+        full_df = pd.concat([existing_df, new_df], ignore_index=True)
+        full_df = (full_df
+                   .drop_duplicates(subset=['time'], keep='last')
+                   .sort_values('time')
+                   .reset_index(drop=True))
+        print(f"   ✨ Merged with Hub history. Total rows: {len(full_df):,}")
+    except:
+        print(f"   🆕 No existing Hub history found for {symbol}_{interval}. Starting fresh.")
+        full_df = new_df
+
+    # Step 3 — Push updated master back to Hub
+    tmp_fd, tmp_path = tempfile.mkstemp(suffix=".parquet")
+    try:
+        os.close(tmp_fd)
+        full_df.to_parquet(tmp_path, index=False)
+        upload_file(
+            path_or_fileobj=tmp_path,
+            path_in_repo=_yf_filename(symbol, interval),
+            repo_id=repo_id,
+            repo_type="dataset",
+            token=hf_token,
+            commit_message=f"Yahoo Sync {symbol} ({interval}) -> {datetime.now(timezone.utc).strftime('%Y-%m-%d')}"
+        )
+    finally:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+
+    return full_df, {
+        "status": "synced",
+        "new_rows": len(new_df),
+        "total_rows": len(full_df),
+        "filename": _yf_filename(symbol, interval)
+    }

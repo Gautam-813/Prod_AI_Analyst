@@ -40,9 +40,22 @@ try:
 except (ImportError, MemoryError):
     AGGRID_AVAILABLE = False
 
-# Page configuration
-st.set_page_config(page_title="NVIDIA Quant Insight Bot", layout="wide")
+# Symbol Mapping (MT5 -> Yahoo Finance)
+YAHOO_MAPPING = {
+    "XAUUSD": "GC=F",      # Gold Futures
+    "EURUSD": "EURUSD=X",  # Euro/USD FX
+    "DXY": "DX-Y.NYB",    # US Dollar Index
+    "^NSEI": "^NSEI",     # Nifty 50 (Identity)
+    "^NSEBANK": "^NSEBANK" # Bank Nifty (Identity)
+}
 
+# Page configuration
+# ── PRO APP BRANDING ──
+st.set_page_config(
+    page_title="AI Quant Analyst | Impulse Master",
+    page_icon="💰",
+    layout="wide",
+)
 # App theme and styling
 st.markdown("""
 <style>
@@ -125,7 +138,7 @@ def check_password():
         import zipfile
         import os
         
-        if st.button("📥 Download EA Package (ZIP)", use_container_width=True):
+        if st.button("📥 Download EA Package (ZIP)", width="stretch"):
             # Create ZIP file in memory
             zip_buffer = io.BytesIO()
             base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -151,7 +164,7 @@ def check_password():
             )
         
         st.markdown("---")
-        if st.button("🚪 Logout", use_container_width=True):
+        if st.button("🚪 Logout", width="stretch"):
             logout()
     
     return True
@@ -278,7 +291,7 @@ with st.sidebar:
     
     st.markdown("---")
     st.subheader("🧠 Memory & Context")
-    if st.button("🗑️ Clear AI Memory Context", use_container_width=True):
+    if st.button("🗑️ Clear AI Memory Context", width="stretch"):
         st.session_state.messages = []
         st.rerun()
 
@@ -297,7 +310,16 @@ with st.sidebar:
                                type="password",
                                help="The token configured in your MT5 Data Server.")
 
-    if st.button("🔌 Test MT5 Connection", use_container_width=True):
+    st.markdown("---")
+    data_source_priority = st.radio(
+        "🌐 **Default Data Source**",
+        ["☁️ Cloud Hub (Hugging Face)", "💾 Local Disk (.parquet)"],
+        index=0,
+        help="Choose where the 'Load' button looks first."
+    )
+    st.session_state.data_source_priority = data_source_priority
+
+    if st.button("🔌 Test MT5 Connection", width="stretch"):
         from data_sync import ping_mt5_server
         result = ping_mt5_server(mt5_url, mt5_token)
         if result["reachable"] and result["mt5_initialized"]:
@@ -334,7 +356,7 @@ with st.sidebar:
                 st.caption(f"📊 {sym} — not loaded")
 
         with col_btn:
-            if st.button(f"🔄 Sync", key=f"sync_{sym}", use_container_width=True):
+            if st.button(f"🔄 Sync", key=f"sync_{sym}", width="stretch"):
                 if not hf_repo or not hf_token:
                     st.error("HF_REPO_ID or HF_TOKEN missing from secrets.toml")
                 elif not mt5_url:
@@ -359,14 +381,11 @@ with st.sidebar:
     st.session_state.auto_sync_on = auto_sync_on
 
     if auto_sync_on:
+        from streamlit_autorefresh import st_autorefresh
         sync_interval = st.selectbox("Frequency ⏱️", [1, 5, 15, 30, 60], index=2, format_func=lambda x: f"Every {x} min")
-        
-        # This invisible component triggers a rerun every X minutes
         refresh_count = st_autorefresh(interval=sync_interval * 60 * 1000, key="sync_counter")
         
-        # Perform sync if refresh triggered
         if refresh_count > 0:
-            # Sync only the symbol the user is currently looking at to save bandwidth
             current_sym = st.session_state.get("current_symbol_view", "XAUUSD")
             if hf_repo and hf_token and mt5_url:
                 from data_sync import sync_symbol
@@ -376,6 +395,78 @@ with st.sidebar:
                     st.toast(f"🔄 Auto-Synced {current_sym} ({stats.get('new_rows', 0)} new candles)")
                 except Exception as e:
                     st.toast(f"🚨 Auto-Sync failed for {current_sym}")
+
+    # --- 🌍 GLOBAL MARKET VAULT ---
+    st.markdown("---")
+    st.subheader("🌍 Global Market Vault")
+    st.caption("Pull stocks/crypto from Yahoo Finance and archive to Cloud Hub.")
+
+    yf_symbol = st.text_input("Ticker Symbol", placeholder="e.g. NVDA, BTC-USD, TSLA")
+    
+    col_per, col_int = st.columns(2)
+    with col_per:
+        yf_period = st.selectbox("History", ["1mo", "3mo", "1y", "5y", "max"], index=4)
+    with col_int:
+        yf_interval = st.selectbox("Interval", ["1h", "1d", "1wk"], index=1)
+
+    if st.button("📥 Fetch & Archive to Cloud", width="stretch"):
+        if not yf_symbol:
+            st.warning("Please enter a ticker symbol.")
+        elif not hf_repo or not hf_token:
+            st.error("Missing Hugging Face credentials in secrets.toml")
+        else:
+            from data_sync import sync_yahoo_symbol
+            with st.spinner(f"Fetching {yf_symbol} from Global Markets..."):
+                try:
+                    df_yf, stats_yf = sync_yahoo_symbol(hf_repo, yf_symbol, hf_token, yf_period, yf_interval)
+                    st.success(f"✅ {yf_symbol} Vaulted: {stats_yf['total_rows']:,} rows in Cloud")
+                    st.session_state.df = df_yf
+                    st.session_state.file_name = stats_yf["filename"]
+                    st.toast(f"🏆 {yf_symbol} added to your Cloud Warehouse!")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"❌ Global Fetch Failed: {e}")
+
+    # --- 🌐 GLOBAL WEB INTEL SEARCH ---
+    st.markdown("---")
+    st.subheader("🌐 Global Web Intel")
+    st.caption("AI-powered research for macro news, sentiment, and geopolitics.")
+
+    search_query = st.text_input("Research Topic", placeholder="e.g. FOMC meeting interest rates, XAUUSD sentiment")
+    
+    col_s1, col_s2 = st.columns(2)
+    with col_s1:
+        max_res = st.slider("Max Results", 3, 10, 5)
+    with col_s2:
+        search_type = st.radio("Focus", ["Market News", "General Search"], index=0, horizontal=True)
+
+    if st.button("🔍 Deep Intel Search", width="stretch"):
+        if not search_query:
+            st.warning("Please enter a research topic.")
+        else:
+            from web_search import run_web_search, get_market_news, analyze_sentiment
+            with st.spinner(f"🔍 AI is researching the web for '{search_query}'..."):
+                try:
+                    if search_type == "Market News":
+                        res = get_market_news(search_query, max_results=max_res)
+                    else:
+                        res = run_web_search(search_query, max_results=max_res)
+                    
+                    if not res:
+                        st.warning("No results found. Try a different query.")
+                    else:
+                        sentiment = analyze_sentiment(res)
+                        st.info(f"🧠 **AI Sentiment Estimate:** {sentiment}")
+                        
+                        st.markdown("### 📰 Latest Findings:")
+                        for r in res:
+                            with st.expander(f"📌 {r['title']}"):
+                                st.write(f"**Source:** {r['href']}")
+                                st.write(f"{r['body']}")
+                                st.markdown(f"[Read full article]({r['href']})")
+                        st.toast("✅ Web Research Completed!")
+                except Exception as e:
+                    st.error(f"❌ Search Error: {e}")
 
 # Arrow-safe display helper (fixes PyArrow serialization errors)
 def make_arrow_safe(df):
@@ -507,46 +598,93 @@ with colA:
         label_visibility="collapsed"
     )
 with colB:
-    if st.button(f"🚀 Load {symbol_choice} Data", use_container_width=True):
+    if st.button(f"🚀 Load {symbol_choice} Data", width="stretch"):
         st.session_state.current_symbol_view = symbol_choice
+        source = st.session_state.get("data_source_priority", "☁️ Cloud Hub")
         
-        # Priority 1: Check if we have synced data in the session state
-        if f"df_{symbol_choice}" in st.session_state:
-            st.session_state.df = st.session_state[f"df_{symbol_choice}"]
-            st.session_state.file_name = f"Synced_{symbol_choice}_Data"
-            st.success(f"Loaded {symbol_choice} from Live Sync Hub!")
-            st.session_state.messages = []
-            st.rerun()
-        
-        # Priority 2: Check for local parquet file
-        import os
-        filename = f"{symbol_choice}_M1_Data.parquet"
-        if os.path.exists(filename):
-            with st.spinner(f"Loading {filename}..."):
-                st.session_state.df = pd.read_parquet(filename)
-                st.session_state.file_name = filename
-                st.session_state.messages = []
-                st.rerun()
-        else:
-            # Priority 3: Try to pull from HF Hub if nothing local exists
+        load_success = False
+
+        # --- BRANCH A: CLOUD HUB FIRST ---
+        if "Cloud Hub" in source:
             if hf_repo and hf_token:
                 from data_sync import load_from_hf
-                with st.spinner(f"📥 Fetching {symbol_choice} from HF Hub..."):
+                with st.spinner(f"📥 Pulling {symbol_choice} from Cloud Hub..."):
                     try:
                         hub_df = load_from_hf(hf_repo, symbol_choice, hf_token)
                         st.session_state.df = hub_df
                         st.session_state[f"df_{symbol_choice}"] = hub_df
-                        st.session_state.file_name = f"Hub_{symbol_choice}_Data"
-                        st.success(f"Dataset retrieved from Hub!")
-                        st.session_state.messages = []
-                        st.rerun()
+                        st.session_state.file_name = f"Cloud_{symbol_choice}_Data"
+                        st.success(f"Latest {symbol_choice} data retrieved from Hub!")
+                        load_success = True
                     except Exception as e:
-                        st.error(f"Cloud dataset not found and local file missing!")
+                        st.warning(f"⚠️ Cloud sync failed: {e}")
+
+        # --- BRANCH B: LOCAL DISK FIRST ---
+        else:
+            import os
+            filename = f"{symbol_choice}_M1_Data.parquet"
+            if os.path.exists(filename):
+                with st.spinner(f"Loading {filename} from disk..."):
+                    try:
+                        st.session_state.df = pd.read_parquet(filename)
+                        st.session_state.file_name = filename
+                        load_success = True
+                    except Exception as e:
+                        st.warning(f"⚠️ Local file error: {e}")
+
+        # --- FALLBACKS ---
+        if not load_success:
+            # If Cloud failed, try Local
+            if "Cloud Hub" in source:
+                import os
+                filename = f"{symbol_choice}_M1_Data.parquet"
+                if os.path.exists(filename):
+                    st.session_state.df = pd.read_parquet(filename)
+                    st.session_state.file_name = filename
+                    load_success = True
+            # If Local failed, try Cloud
             else:
-                st.error(f"Missing local file and cloud credentials!")
+                if hf_repo and hf_token:
+                    from data_sync import load_from_hf
+                    try:
+                        hub_df = load_from_hf(hf_repo, symbol_choice, hf_token)
+                        st.session_state.df = hub_df
+                        st.session_state[f"df_{symbol_choice}"] = hub_df
+                        st.session_state.file_name = f"Cloud_{symbol_choice}_Data"
+                        load_success = True
+                    except: pass
+
+        if load_success:
+            # --- 🚀 NEW: MASTER AUTO-BRIDGE ---
+            current_df = st.session_state.df
+            if current_df is not None and not current_df.empty:
+                from data_sync import get_gap_info
+                gap = get_gap_info(current_df)
+                
+                # If gap is larger than 1 hour, try to auto-bridge via Yahoo Finance
+                if gap["gap_hours"] > 1.0 and symbol_choice in YAHOO_MAPPING:
+                    target_yh = YAHOO_MAPPING[symbol_choice]
+                    with st.status(f"🛰️ Auto-Bridging {symbol_choice}... (Gap: {gap['label']})"):
+                        try:
+                            from data_sync import sync_yahoo_symbol
+                            # Use '1d' or '1h' logic here. For now, we'll keep it simple.
+                            # We determine the interval from the loaded data if possible.
+                            # Default to 1d sync for indices/commodities
+                            sync_df, sync_stats = sync_yahoo_symbol(hf_repo, target_yh, hf_token, period="1mo", interval="1d")
+                            if sync_stats["status"] == "synced":
+                                st.session_state.df = sync_df
+                                st.session_state[f"df_{symbol_choice}"] = sync_df
+                                st.toast(f"✅ Master Hub Updated! (+{sync_stats['new_rows']} candles via Yahoo)")
+                        except Exception as yh_err:
+                            st.toast(f"ℹ️ Auto-Bridge skipped: {yh_err}")
+
+            st.session_state.messages = []
+            st.rerun()
+        else:
+            st.error(f"No data found for {symbol_choice} in Cloud OR Local Disk!")
 
 with colC:
-    if st.button("🧹 Clear Dataset", use_container_width=True):
+    if st.button("🧹 Clear Dataset", width="stretch"):
         if 'df' in st.session_state:
             del st.session_state['df']
         st.session_state.messages = []
@@ -609,16 +747,16 @@ if 'df' in st.session_state and st.session_state.df is not None:
     with tab1:
         st.subheader("🤖 AI Data Analyst")
         with st.expander("📊 Data Preview & Schema", expanded=True):
-            st.dataframe(make_arrow_safe(df.head()), use_container_width=True)
+            st.dataframe(make_arrow_safe(df.head()), width="stretch")
             col1, col2 = st.columns(2)
             with col1:
                 st.write("Column Types:")
                 # Avoid Arrow error: df.dtypes has dtype objects PyArrow can't serialize
                 dtypes_df = pd.DataFrame({"Column": df.columns, "Type": [str(t) for t in df.dtypes]})
-                st.dataframe(make_arrow_safe(dtypes_df), use_container_width=True, hide_index=True)
+                st.dataframe(make_arrow_safe(dtypes_df), width="stretch", hide_index=True)
             with col2:
                 st.write("Basic Stats:")
-                st.dataframe(make_arrow_safe(df.describe()), use_container_width=True)
+                st.dataframe(make_arrow_safe(df.describe()), width="stretch")
 
         if "messages" not in st.session_state:
             st.session_state.messages = []

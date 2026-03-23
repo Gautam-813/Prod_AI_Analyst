@@ -14,11 +14,31 @@ from typing import Optional, Annotated
 import re
 import uvicorn
 import os
+import signal
+import sys
 
 # ============================================================================
-# Security Configuration
+# Interactive Startup Configuration
 # ============================================================================
-MT5_API_TOKEN = os.getenv("MT5_API_TOKEN", "impulse_secure_2026")
+def get_startup_config():
+    print("\n" + "=" * 60)
+    print("      🚀 MT5 Data Server v2.5 — Configuration Startup")
+    print("=" * 60 + "\n")
+
+    default_port = os.getenv("MT5_SERVER_PORT", "5000")
+    port_input = input(f"🔹 Enter Port [Default {default_port}]: ") or default_port
+    port = int(port_input)
+
+    default_token = os.getenv("MT5_API_TOKEN", "impulse_secure_2026")
+    token_input = input(f"🔹 Enter Security Token [Default '{default_token}']: ") or default_token
+    
+    print("\n🔹 Multiple MT5 Instances Detected?")
+    print("   (Leave empty to use your default/active MT5)")
+    terminal_path = input("🔹 Enter MT5 Terminal Path (e.g. C:\\...\\terminal64.exe): ").strip() or None
+
+    return port, token_input, terminal_path
+
+PORT, MT5_API_TOKEN, STARTUP_PATH = get_startup_config()
 
 async def verify_token(x_mt5_token: Annotated[str | None, Header()] = None):
     if x_mt5_token != MT5_API_TOKEN:
@@ -137,11 +157,57 @@ class MT5DataProvider:
             print(f"Symbol info error: {e}")
             return None
 
+    def resolve_symbol_name(self, target_name):
+        """
+        Smart resolution: XAUUSD -> XAUUSDm, XAUUSD.sc, etc.
+        """
+        # 1. Direct match
+        if mt5.symbol_info(target_name):
+            return target_name
+
+        # 2. Case-insensitive Regex search
+        try:
+            all_symbols = mt5.symbols_get()
+            if all_symbols:
+                # Try regex match for things like XAUUSDm, XAUUSD.pro
+                regex = re.compile(re.escape(target_name), re.IGNORECASE)
+                for s in all_symbols:
+                    if regex.search(s.name):
+                        print(f"🔍 Auto-Resolved '{target_name}' → '{s.name}'")
+                        return s.name
+                
+                # Special case for GOLD -> XAUUSD
+                if target_name.upper() == "GOLD":
+                    regex_xau = re.compile("XAUUSD", re.IGNORECASE)
+                    for s in all_symbols:
+                        if regex_xau.search(s.name):
+                            print(f"🔍 Auto-Resolved 'GOLD' → '{s.name}'")
+                            return s.name
+                
+                # Special case for XAUUSD -> GOLD
+                if target_name.upper() == "XAUUSD":
+                    regex_gold = re.compile("GOLD", re.IGNORECASE)
+                    for s in all_symbols:
+                        if regex_gold.search(s.name):
+                            print(f"🔍 Auto-Resolved 'XAUUSD' → '{s.name}'")
+                            return s.name
+        except:
+            pass
+        
+        return target_name # fallback
+
     def fetch_ohlc_data(self, symbol, timeframe, start_date, end_date):
-        """Fetch OHLC data for given parameters"""
+        """
+        Fetch OHLC data for given parameters
+        """
         if not self.initialized:
             return None, "MT5 not initialized"
+        
         try:
+            # Smart Resolve Symbol Name
+            symbol = self.resolve_symbol_name(symbol)
+
+            # Enable symbol if not visible
             if not mt5.symbol_select(symbol, True):
                 return None, f"Failed to select symbol: {symbol}"
 
@@ -343,19 +409,29 @@ def shutdown_mt5(token: Annotated[str, Depends(verify_token)]):
 # Entry Point
 # ============================================================================
 if __name__ == '__main__':
-    print("=" * 70)
-    print("  MT5 Data Server v2.0 — FastAPI + Uvicorn")
-    print("=" * 70)
-    print("\n  Swagger UI:   http://localhost:5000/docs")
-    print("  ReDoc UI:     http://localhost:5000/redoc")
-    print("\n  Endpoints:")
-    print("    POST  /initialize        — Connect to MT5 terminal")
-    print("    POST  /symbols/search    — Search symbols by pattern")
-    print("    GET   /symbols/info/{s}  — Get symbol details")
-    print("    POST  /data/fetch        — Fetch OHLC (custom date range)")
-    print("    POST  /data/quick-fetch  — Fetch OHLC (quick preset)")
-    print("    GET   /health            — Server health check")
-    print("    POST  /shutdown          — Disconnect from MT5")
-    print("\n" + "=" * 70)
+    # Initial attempt to connect MT5 with startup path
+    print("\n" + "=" * 60)
+    print("  MT5 Data Server — Interactive + Secure Mode")
+    print("=" * 60)
+    
+    if provider.initialize_mt5(STARTUP_PATH):
+        print(f"✅ Auto-Connected to MT5 Terminal")
+        acc = mt5.account_info()
+        if acc: print(f"   Account: {acc.login} | Server: {acc.server}")
+    else:
+        print(f"⚠️  Manual MT5 initialization required (Call /initialize via API)")
 
-    uvicorn.run("mt5_data_server:app", host="0.0.0.0", port=5000, reload=True)
+    print(f"\n🚀 Server starting on http://localhost:{PORT}")
+    print(f"🔑 Security Token ACTIVE: {MT5_API_TOKEN}")
+    print("\n  Swagger UI:   /docs")
+    print("=" * 60 + "\n")
+
+    # Clean Port Disposal Handler
+    def signal_handler(sig, frame):
+        print("\n🛑 Shutting down server and releasing port...")
+        provider.shutdown()
+        sys.exit(0)
+    
+    signal.signal(signal.SIGINT, signal_handler)
+
+    uvicorn.run(app, host="0.0.0.0", port=PORT)
