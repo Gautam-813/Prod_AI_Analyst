@@ -631,86 +631,92 @@ with colB:
     if st.button(f"🚀 Load {symbol_choice} Data", width="stretch"):
         st.session_state.current_symbol_view = symbol_choice
         source = st.session_state.get("data_source_priority", "☁️ Cloud Hub")
-        
         load_success = False
+        hf_rows_before = 0
 
-        # --- BRANCH A: CLOUD HUB FIRST ---
+        # ── STEP 1: Fetch existing data from Hugging Face Hub ───────────────
         if "Cloud Hub" in source:
             if hf_repo and hf_token:
                 from data_sync import load_from_hf
-                with st.spinner(f"📥 Pulling {symbol_choice} from Cloud Hub..."):
+                with st.spinner(f"📥 Step 1/3 — Fetching existing data for {symbol_choice} from Hugging Face Hub..."):
                     try:
                         hub_df = load_from_hf(hf_repo, symbol_choice, hf_token)
+                        hf_rows_before = len(hub_df)
                         st.session_state.df = hub_df
                         st.session_state[f"df_{symbol_choice}"] = hub_df
                         st.session_state.file_name = f"Cloud_{symbol_choice}_Data"
-                        st.success(f"Latest {symbol_choice} data retrieved from Hub!")
+                        st.info(f"☁️ Loaded **{hf_rows_before:,} rows** from Hugging Face Hub.")
                         load_success = True
                     except Exception as e:
-                        st.warning(f"⚠️ Cloud sync failed: {e}")
+                        st.warning(f"⚠️ Cloud Hub fetch failed: {e}. Trying local disk...")
 
-        # --- BRANCH B: LOCAL DISK FIRST ---
-        else:
+        # Fallback to local disk
+        if not load_success:
             import os
             filename = f"{symbol_choice}_M1_Data.parquet"
             if os.path.exists(filename):
-                with st.spinner(f"Loading {filename} from disk..."):
+                with st.spinner(f"Loading {filename} from local disk..."):
                     try:
-                        st.session_state.df = pd.read_parquet(filename)
+                        disk_df = pd.read_parquet(filename)
+                        hf_rows_before = len(disk_df)
+                        st.session_state.df = disk_df
                         st.session_state.file_name = filename
+                        st.info(f"💾 Loaded **{hf_rows_before:,} rows** from local disk.")
                         load_success = True
                     except Exception as e:
                         st.warning(f"⚠️ Local file error: {e}")
 
-        # --- FALLBACKS ---
         if not load_success:
-            # If Cloud failed, try Local
-            if "Cloud Hub" in source:
-                import os
-                filename = f"{symbol_choice}_M1_Data.parquet"
-                if os.path.exists(filename):
-                    st.session_state.df = pd.read_parquet(filename)
-                    st.session_state.file_name = filename
-                    load_success = True
-            # If Local failed, try Cloud
-            else:
-                if hf_repo and hf_token:
-                    from data_sync import load_from_hf
-                    try:
-                        hub_df = load_from_hf(hf_repo, symbol_choice, hf_token)
-                        st.session_state.df = hub_df
-                        st.session_state[f"df_{symbol_choice}"] = hub_df
-                        st.session_state.file_name = f"Cloud_{symbol_choice}_Data"
-                        load_success = True
-                    except: pass
-
-        if load_success:
-            # --- 🚀 NEW: MASTER AUTO-BRIDGE ---
+            st.error(f"❌ No data found for {symbol_choice} on Hugging Face Hub OR Local Disk!")
+        else:
             current_df = st.session_state.df
-            if current_df is not None and not current_df.empty:
-                from data_sync import get_gap_info
-                gap = get_gap_info(current_df)
-                
-                # If gap is larger than 1 hour, try to auto-bridge via Yahoo Finance
-                if gap["gap_hours"] > 1.0 and symbol_choice in YAHOO_MAPPING:
-                    target_yh = YAHOO_MAPPING[symbol_choice]
-                    with st.status(f"🛰️ Auto-Bridging {symbol_choice}... (Gap: {gap['label']})"):
-                        try:
-                            from data_sync import sync_yahoo_symbol
-                            # Use '1m' to match the M1 master history
-                            # period '7d' is the max for 1m data on Yahoo Finance
-                            sync_df, sync_stats = sync_yahoo_symbol(hf_repo, target_yh, hf_token, period="7d", interval="1m")
-                            if sync_stats["status"] == "synced":
-                                st.session_state.df = sync_df
-                                st.session_state[f"df_{symbol_choice}"] = sync_df
-                                st.toast(f"✅ Master Hub Healed! (+{sync_stats['new_rows']} minutes)")
-                        except Exception as yh_err:
-                            st.toast(f"ℹ️ Auto-Bridge skipped: {yh_err}")
+
+            # ── STEP 2: Detect gap & fetch new data ─────────────────────────
+            from data_sync import get_gap_info
+            gap = get_gap_info(current_df)
+
+            if gap["gap_hours"] <= 0.25:
+                st.success(f"✅ {symbol_choice} data is already fresh ({gap['label']}). No sync needed.")
+            elif symbol_choice in YAHOO_MAPPING:
+                target_yh = YAHOO_MAPPING[symbol_choice]
+                st.info(f"🕐 Gap detected: **{gap['label']}**. Fetching new candles from Yahoo Finance ({target_yh})...")
+
+                with st.spinner(f"📡 Step 2/3 — Fetching new {symbol_choice} candles (last 7 days) from Yahoo Finance..."):
+                    try:
+                        from data_sync import sync_yahoo_symbol
+                        # sync_yahoo_symbol already:
+                        #   1. Fetches new data from Yahoo
+                        #   2. Loads existing from HF Hub
+                        #   3. Merges (dedup + sort)
+                        #   4. Pushes the merged result back to HF Hub
+                        sync_df, sync_stats = sync_yahoo_symbol(
+                            hf_repo, target_yh, hf_token,
+                            existing_df=current_df   # ← pass already-loaded HF data; skips redundant re-download
+                        )
+
+                        hf_rows_after = len(sync_df)
+                        new_rows_added = hf_rows_after - hf_rows_before
+
+                        # ── STEP 3: Update session with merged result ────────
+                        st.session_state.df = sync_df
+                        st.session_state[f"df_{symbol_choice}"] = sync_df
+
+                        st.success(
+                            f"✅ Step 3/3 — Merge complete & pushed back to Hugging Face Hub!\n\n"
+                            f"- **Rows on Hub before sync:** {hf_rows_before:,}\n"
+                            f"- **New rows fetched & merged:** +{new_rows_added:,}\n"
+                            f"- **Total rows now on Hub:** {hf_rows_after:,}"
+                        )
+                        st.toast(f"🚀 {symbol_choice} synced! +{new_rows_added:,} new rows pushed to Hub.")
+
+                    except Exception as yh_err:
+                        st.warning(f"⚠️ Auto-sync skipped (Yahoo Finance unreachable or no new data): {yh_err}")
+                        st.info("Displaying existing Hub data as-is.")
+            else:
+                st.warning(f"⚠️ Gap of **{gap['label']}** detected but no Yahoo Finance mapping for {symbol_choice}. Use MT5 Sync instead.")
 
             st.session_state.messages = []
             st.rerun()
-        else:
-            st.error(f"No data found for {symbol_choice} in Cloud OR Local Disk!")
 
 with colC:
     if st.button("🧹 Clear Dataset", width="stretch"):

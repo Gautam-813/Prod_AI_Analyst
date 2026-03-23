@@ -17,6 +17,16 @@ from datetime import datetime, timezone
 SYMBOLS    = ["XAUUSD", "EURUSD"]
 TIMEFRAME  = "1m"
 
+# MT5 symbol → Yahoo Finance ticker mapping
+# Keeps data_sync.py self-contained (no import from app.py needed)
+YAHOO_MAPPING = {
+    "XAUUSD":    "GC=F",       # Gold Futures
+    "EURUSD":    "EURUSD=X",   # Euro/USD FX
+    "DXY":       "DX-Y.NYB",   # US Dollar Index
+    "^NSEI":     "^NSEI",      # Nifty 50 (Identity)
+    "^NSEBANK":  "^NSEBANK",   # Bank Nifty (Identity)
+}
+
 def _filename(symbol: str) -> str:
     return f"{symbol}_M1_Data.parquet"
 
@@ -249,87 +259,172 @@ def get_gap_info(df):
     except Exception as e:
         print(f"DEBUG: Gap check error: {e}")
         return {"gap_hours": 0, "label": "Clock error", "is_fresh": False}
-def sync_yahoo_symbol(repo_id: str, symbol: str, hf_token: str, 
-                      period="max", interval="1d") -> tuple[pd.DataFrame, dict]:
+def sync_yahoo_symbol(repo_id: str, symbol: str, hf_token: str,
+                      existing_df: pd.DataFrame = None) -> tuple[pd.DataFrame, dict]:
     """
-    Pulls data from yfinance, merges with Hub, and pushes back.
-    Automatically creates a filename like 'NVDA_1d_Data.parquet'.
+    Smart delta-sync from Yahoo Finance:
+      1. Finds the last timestamp in existing_df (or HF Hub).
+      2. Fetches ONLY the missing candles from that timestamp → now.
+      3. Merges, deduplicates, sorts, and pushes the result back to HF Hub.
+
+    Parameters
+    ----------
+    existing_df : pd.DataFrame, optional
+        Already-loaded Hub DataFrame.  When supplied, the function skips the
+        internal HF re-download entirely (no double-fetch).
     """
-    print(f"🔄 Syncing {symbol} from Yahoo Finance...")
+    from datetime import timezone
     from huggingface_hub import upload_file
 
-    def _yf_filename(s: str, i: str) -> str:
-        # Check if this is a standard MT5-style symbol
-        for mt5_sym, yh_sym in YAHOO_MAPPING.items():
-            if s == yh_sym: return f"{mt5_sym}_M1_Data.parquet"
-        return f"{s}_{i}_Data.parquet"
+    INTERVAL = "1m"          # M1 candles
+    YF_MAX_DAYS_1M = 6       # Yahoo caps 1m history at ~7 days; use 6 to be safe
 
-    # Step 1 — Fetch new data from Yahoo
+    def _yf_filename(s: str) -> str:
+        """Reverse-map a Yahoo ticker back to the MT5-style parquet filename."""
+        for mt5_sym, yh_sym in YAHOO_MAPPING.items():
+            if s == yh_sym:
+                return f"{mt5_sym}_M1_Data.parquet"
+        return f"{s}_{INTERVAL}_Data.parquet"
+
+    target_filename = _yf_filename(symbol)
+    now_utc = datetime.now(timezone.utc)
+    print(f"\n🔄 Smart delta-sync: {symbol}  →  {target_filename}")
+
+    # ── Step A: Resolve the existing Hub data ──────────────────────────────
+    if existing_df is not None and not existing_df.empty:
+        hub_df = existing_df.copy()
+        hub_df['time'] = pd.to_datetime(hub_df['time'], utc=True, errors='coerce')
+        print(f"   📂 Using caller-supplied data. Rows on Hub: {len(hub_df):,}")
+    else:
+        try:
+            from huggingface_hub import hf_hub_download
+            local_cache = hf_hub_download(
+                repo_id=repo_id, filename=target_filename,
+                repo_type="dataset", token=hf_token, force_download=True
+            )
+            hub_df = pd.read_parquet(local_cache)
+            hub_df['time'] = pd.to_datetime(hub_df['time'], utc=True)
+            print(f"   ☁️  Downloaded Hub data. Rows: {len(hub_df):,}")
+        except Exception as dl_err:
+            print(f"   🆕 No existing Hub file ({target_filename}). Starting fresh. [{dl_err}]")
+            hub_df = pd.DataFrame()
+
+    # ── Step B: Determine exact start for the delta fetch ─────────────────
+    if not hub_df.empty:
+        last_ts = hub_df['time'].max()                  # last known candle
+        gap_hours = (now_utc - last_ts).total_seconds() / 3600
+        gap_label = (
+            f"{int(gap_hours * 60)} min" if gap_hours < 1
+            else f"{gap_hours:.1f} h" if gap_hours < 24
+            else f"{gap_hours / 24:.1f} days"
+        )
+        print(f"   🕐 Last candle: {last_ts.strftime('%Y-%m-%d %H:%M UTC')}  |  Gap: {gap_label}")
+
+        if gap_hours < 0.25:
+            print("   ✅ Data is already fresh — no fetch needed.")
+            return hub_df, {"status": "already_fresh", "new_rows": 0, "total_rows": len(hub_df),
+                            "filename": target_filename}
+
+        # Yahoo Finance 1m data: max look-back is ~7 days
+        # Clamp start so we never request further back than Yahoo allows
+        earliest_allowed = now_utc - pd.Timedelta(days=YF_MAX_DAYS_1M)
+        fetch_start = pd.Timestamp(max(last_ts, earliest_allowed))
+    else:
+        # No existing data — fetch the max Yahoo allows for 1m
+        fetch_start = pd.Timestamp(now_utc - pd.Timedelta(days=YF_MAX_DAYS_1M))
+        gap_label = f"{YF_MAX_DAYS_1M} days (fresh start)"
+
+    print(f"   📡 Fetching delta: {fetch_start.strftime('%Y-%m-%d %H:%M UTC')} → now")
+
+    # ── Step C: Fetch ONLY the missing candles from Yahoo ─────────────────
     try:
         ticker = yf.Ticker(symbol)
-        # Fetching 'period' (e.g. 5y, max, 1mo)
-        new_df = ticker.history(period=period, interval=interval)
-        
+        new_df = ticker.history(
+            start=fetch_start.strftime("%Y-%m-%d"),   # yfinance needs date-only (YYYY-MM-DD)
+            end=(now_utc + pd.Timedelta(days=1)).strftime("%Y-%m-%d"),  # +1d so today is included
+            interval=INTERVAL
+        )
         if new_df.empty:
-            raise ValueError(f"No data returned for ticker {symbol}")
+            print("   ⚠️  Yahoo returned 0 rows for the requested range.")
+            return hub_df if not hub_df.empty else pd.DataFrame(), {
+                "status": "no_new_data", "new_rows": 0,
+                "total_rows": len(hub_df), "filename": target_filename
+            }
 
-        # Standardize index and columns
         new_df = new_df.reset_index()
-        # Ensure time column is renamed to standard lowercase 'time'
-        time_col = next((c for c in new_df.columns if c.lower() in ("date", "datetime")), new_df.columns[0])
+        time_col = next(
+            (c for c in new_df.columns if c.lower() in ("datetime", "date")),
+            new_df.columns[0]
+        )
         new_df = new_df.rename(columns={
-            time_col: 'time',
-            'Open': 'open',
-            'High': 'high',
-            'Low': 'low',
-            'Close': 'close',
-            'Volume': 'tick_volume',
-            'Dividends': 'dividends',
-            'Stock Splits': 'splits'
+            time_col:       'time',
+            'Open':         'open',
+            'High':         'high',
+            'Low':          'low',
+            'Close':        'close',
+            'Volume':       'tick_volume',
+            'Dividends':    'dividends',
+            'Stock Splits': 'splits',
         })
         new_df['time'] = pd.to_datetime(new_df['time'], utc=True)
-        # Lowercase any other remaining columns
         new_df.columns = [c.lower() for c in new_df.columns]
+        print(f"   📥 Fetched {len(new_df):,} new candles from Yahoo Finance.")
 
     except Exception as e:
-        raise RuntimeError(f"[Yahoo Fetch] Failed: {e}")
+        raise RuntimeError(f"[Yahoo Fetch] {symbol}: {e}")
 
-    # Step 2 — Attempt to Merge with existing Cloud Hub data
-    try:
-        from huggingface_hub import hf_hub_download
-        local_cache = hf_hub_download(
-            repo_id=repo_id,
-            filename=_yf_filename(symbol, interval),
-            repo_type="dataset",
-            token=hf_token
-        )
-        existing_df = pd.read_parquet(local_cache)
-        existing_df['time'] = pd.to_datetime(existing_df['time'], utc=True)
-        
-        # Merge, dedup, sort
-        full_df = pd.concat([existing_df, new_df], ignore_index=True)
-        full_df = (full_df
-                   .drop_duplicates(subset=['time'], keep='last')
-                   .sort_values('time')
-                   .reset_index(drop=True))
-        print(f"   ✨ Merged with Hub history. Total rows: {len(full_df):,}")
-    except:
-        print(f"   🆕 No existing Hub history found for {symbol}_{interval}. Starting fresh.")
+    # Step 2 — Merge with existing Hub data
+    # Priority: use the caller-supplied existing_df first (avoids redundant HF download)
+    if existing_df is not None and not existing_df.empty:
+        print(f"   🔗 Using caller-supplied existing data ({len(existing_df):,} rows). Skipping HF re-download.")
+        hub_df = existing_df.copy()
+        hub_df['time'] = pd.to_datetime(hub_df['time'], utc=True, errors='coerce')
+    else:
+        # Fallback: download existing file from HF Hub
+        try:
+            from huggingface_hub import hf_hub_download
+            local_cache = hf_hub_download(
+                repo_id=repo_id,
+                filename=target_filename,
+                repo_type="dataset",
+                token=hf_token,
+                force_download=True   # always get latest
+            )
+            hub_df = pd.read_parquet(local_cache)
+            hub_df['time'] = pd.to_datetime(hub_df['time'], utc=True)
+            print(f"   ☁️  Downloaded existing Hub data ({len(hub_df):,} rows).")
+        except Exception as dl_err:
+            print(f"   🆕 No existing Hub file found ({target_filename}): {dl_err}. Starting fresh.")
+            hub_df = pd.DataFrame()
+
+    # ── Step D: Merge new delta into Hub data ─────────────────────────────
+    if hub_df.empty:
         full_df = new_df
+        print(f"   🆕 Starting fresh with {len(full_df):,} rows.")
+    else:
+        full_df = pd.concat([hub_df, new_df], ignore_index=True)
+        full_df = (
+            full_df
+            .drop_duplicates(subset=['time'], keep='last')
+            .sort_values('time')
+            .reset_index(drop=True)
+        )
+        print(f"   ✨ Merged. Total rows: {len(full_df):,} (was {len(hub_df):,}, +{len(new_df):,} new candles)")
 
-    # Step 3 — Push updated master back to Hub
+    # ── Step E: Push merged result back to HF Hub ──────────────────────────
     tmp_fd, tmp_path = tempfile.mkstemp(suffix=".parquet")
     try:
         os.close(tmp_fd)
         full_df.to_parquet(tmp_path, index=False)
         upload_file(
             path_or_fileobj=tmp_path,
-            path_in_repo=_yf_filename(symbol, interval),
+            path_in_repo=target_filename,
             repo_id=repo_id,
             repo_type="dataset",
             token=hf_token,
-            commit_message=f"Yahoo Sync {symbol} ({interval}) -> {datetime.now(timezone.utc).strftime('%Y-%m-%d')}"
+            commit_message=f"Delta sync {symbol} ({INTERVAL}) → {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
         )
+        print(f"   ☁️  Pushed {target_filename} to Hub successfully.")
     finally:
         if os.path.exists(tmp_path):
             os.unlink(tmp_path)
@@ -338,5 +433,5 @@ def sync_yahoo_symbol(repo_id: str, symbol: str, hf_token: str,
         "status": "synced",
         "new_rows": len(new_df),
         "total_rows": len(full_df),
-        "filename": _yf_filename(symbol, interval)
+        "filename": target_filename,
     }
