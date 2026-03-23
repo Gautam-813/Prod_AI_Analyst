@@ -505,8 +505,8 @@ def make_arrow_safe(df):
         return df
     out = df.copy()
     for col in out.columns:
-        if out[col].dtype == object or str(out[col].dtype).startswith('datetime64'):
-            # Convert object and datetime to string (Arrow-safe)
+        if out[col].dtype == object:
+            # Only convert strict object types to string; leave datetimes alone!
             out[col] = out[col].astype(str)
         elif 'mixed' in str(out[col].dtype).lower() or 'period' in str(out[col].dtype).lower():
             out[col] = out[col].astype(str)
@@ -619,12 +619,20 @@ def execute_generated_code(code, df):
 # Main Application
 st.title("🏛️ NVIDIA NIM Professional Quant Station")
 
-st.markdown("### 📥 Select Dataset")
-colA, colB, colC = st.columns([1.5, 2, 1])
+st.markdown("### 📥 Select Dataset & Range")
+colA, colD, colB, colC = st.columns([1.5, 1.5, 2, 1])
 with colA:
     symbol_choice = st.selectbox(
         "Select Symbol", 
         ["XAUUSD", "EURUSD", "DXY"],
+        label_visibility="collapsed"
+    )
+with colD:
+    lookback_choice = st.selectbox(
+        "Lookback Period",
+        ["Last 7 Days", "Last 30 Days", "Last 3 Months", "Last 6 Months", "1 Year", "All Data"],
+        index=1,
+        help="Select how much data to load into the UI to save memory.",
         label_visibility="collapsed"
     )
 with colB:
@@ -708,12 +716,44 @@ with colB:
                             f"- **Total rows now on Hub:** {hf_rows_after:,}"
                         )
                         st.toast(f"🚀 {symbol_choice} synced! +{new_rows_added:,} new rows pushed to Hub.")
+                        
+                        # Use the freshly synced dataframe as our current_df
+                        current_df = sync_df
 
                     except Exception as yh_err:
                         st.warning(f"⚠️ Auto-sync skipped (Yahoo Finance unreachable or no new data): {yh_err}")
                         st.info("Displaying existing Hub data as-is.")
             else:
                 st.warning(f"⚠️ Gap of **{gap['label']}** detected but no Yahoo Finance mapping for {symbol_choice}. Use MT5 Sync instead.")
+
+            # ── STEP 4: Apply memory-safe lookback filter ────────────────────────
+            time_cols = [c for c in current_df.columns if 'time' in c.lower() or 'date' in c.lower()]
+            if time_cols and lookback_choice != "All Data":
+                time_col = time_cols[0]
+                current_df[time_col] = pd.to_datetime(current_df[time_col], utc=True, errors='coerce')
+                max_time = current_df[time_col].max()
+                
+                if lookback_choice == "Last 7 Days":
+                    cutoff = max_time - pd.Timedelta(days=7)
+                elif lookback_choice == "Last 30 Days":
+                    cutoff = max_time - pd.Timedelta(days=30)
+                elif lookback_choice == "Last 3 Months":
+                    cutoff = max_time - pd.Timedelta(days=90)
+                elif lookback_choice == "Last 6 Months":
+                    cutoff = max_time - pd.Timedelta(days=180)
+                elif lookback_choice == "1 Year":
+                    cutoff = max_time - pd.Timedelta(days=365)
+                
+                # Filter down to save memory
+                memory_safe_df = current_df[current_df[time_col] >= cutoff].reset_index(drop=True)
+                st.session_state.df = memory_safe_df
+                st.session_state[f"df_{symbol_choice}"] = memory_safe_df
+                st.info(f"✂️ UI Memory Safe Mode: Loaded **{len(memory_safe_df):,}** rows ({lookback_choice}) out of **{len(current_df):,}** total.)")
+            else:
+                # User chose "All Data" (or time col not found)
+                st.session_state.df = current_df
+                st.session_state[f"df_{symbol_choice}"] = current_df
+                st.info(f"⚠️ Loaded FULL dataset into UI memory: **{len(current_df):,}** rows.")
 
             st.session_state.messages = []
             st.rerun()
@@ -737,43 +777,34 @@ if uploaded_file is not None:
             st.success("Professional environment initialized!")
 
 if 'df' in st.session_state and st.session_state.df is not None:
-    df_raw = st.session_state.df.copy()
-    
+    # Use reference instead of full copy to save memory (especially on 1.8M row datasets)
+    df_raw = st.session_state.df
+    df = df_raw  # Default to full
+
     # --- DATE RANGE FILTERING ---
     time_cols = [c for c in df_raw.columns if 'time' in c.lower() or 'date' in c.lower()]
     if time_cols:
         main_time_col = time_cols[0]
-        # Force to datetime for filtering
-        df_raw[main_time_col] = pd.to_datetime(df_raw[main_time_col], errors='coerce')
-        valid_dates = df_raw[main_time_col].dropna()
+        # Extract time series for filtering without coercing the dataframe itself
+        times = pd.to_datetime(df_raw[main_time_col], errors='coerce')
+        valid_dates = times.dropna()
         if not valid_dates.empty:
             st.markdown("### 📅 Filter Data by Date")
             min_date = valid_dates.min().date()
             max_date = valid_dates.max().date()
-            
+
             selected_dates = st.date_input(
                 f"Select Range ({main_time_col})", 
                 value=[min_date, max_date], 
                 min_value=min_date, 
                 max_value=max_date
             )
-            
+
             if len(selected_dates) == 2:
                 start_date, end_date = selected_dates
-                mask = (df_raw[main_time_col].dt.date >= start_date) & (df_raw[main_time_col].dt.date <= end_date)
-                df = df_raw.loc[mask].copy()
+                mask = (times.dt.date >= start_date) & (times.dt.date <= end_date)
+                df = df_raw.loc[mask]
                 st.info(f"✅ Filtered to {len(df):,} rows (from {start_date} to {end_date}).")
-            else:
-                df = df_raw.copy()
-        else:
-            df = df_raw.copy()
-    else:
-        df = df_raw.copy()
-        
-    # Convert time columns back to strings so Arrow Serialization never fails when rendering Tabs
-    for c in df.columns:
-        if str(df[c].dtype).startswith("datetime"):
-            df[c] = df[c].astype(str)
 
 
     # TABBED NAVIGATION
@@ -983,8 +1014,13 @@ if 'df' in st.session_state and st.session_state.df is not None:
     with tab2:
         st.subheader("📊 Drag-and-Drop Visual Explorer")
         if PYG_AVAILABLE:
-            # Initialize PyGWalker (use Arrow-safe copy)
-            pyg_html = pyg.to_html(make_arrow_safe(df))
+            if len(df) > 200000:
+                st.warning(f"⚠️ Dataset is very large ({len(df):,} rows). Truncating to the latest 200,000 rows for the Visual Explorer to prevent the browser from crashing.")
+                viz_df = df.tail(200000)
+            else:
+                viz_df = df
+            
+            pyg_html = pyg.to_html(make_arrow_safe(viz_df))
             st.components.v1.html(pyg_html, height=1000, scrolling=True)
         else:
             st.error("PyGWalker is unavailable due to memory constraints on this system.")
@@ -993,10 +1029,17 @@ if 'df' in st.session_state and st.session_state.df is not None:
     with tab3:
         st.subheader("🗃️ Interactive Data Grid")
         if AGGRID_AVAILABLE:
-            AgGrid(make_arrow_safe(df), height=600, theme='alpine', enable_enterprise_modules=False)
+            if len(df) > 50000:
+                st.warning(f"⚠️ Dataset is very large ({len(df):,} rows). Truncating to the latest 50,000 rows for the Data Grid to keep the UI responsive.")
+                grid_df = df.tail(50000)
+            else:
+                grid_df = df
+            AgGrid(make_arrow_safe(grid_df), height=600, theme='alpine', enable_enterprise_modules=False)
         else:
-            st.error("AgGrid is unavailable due to memory constraints.")
-            st.dataframe(make_arrow_safe(df.head(100)))
+            st.error("AgGrid is unavailable (likely not installed or disabled).")
+            # For st.dataframe, Streamlit automatically paginates so it's safe to pass the full dataframe
+            st.dataframe(make_arrow_safe(df))
+
 
 else:
     st.write("👋 Welcome! Please upload your dataset (CSV or Parquet) to start the analysis.")
