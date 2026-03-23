@@ -56,6 +56,11 @@ st.set_page_config(
     page_icon="💰",
     layout="wide",
 )
+
+# --- 🚀 CLOUD DETECTION ---
+import os
+IS_CLOUD = os.environ.get("STREAMLIT_SERVER_PORT") is not None or "HOSTNAME" in os.environ
+# -------------------------
 # App theme and styling
 st.markdown("""
 <style>
@@ -340,39 +345,37 @@ with st.sidebar:
         col_label, col_btn = st.columns([3, 2])
         with col_label:
             # Show data freshness if parquet is loaded
-            if f"df_{sym}" in st.session_state:
-                from data_sync import get_gap_info
-                try:
+            try:
+                if f"df_{sym}" in st.session_state:
+                    from data_sync import get_gap_info
                     gap = get_gap_info(st.session_state[f"df_{sym}"])
-                    if gap["is_fresh"]:
+                    if gap.get("gap_hours", 0) < 1:
                         st.caption(f"🟢 {sym} — Fresh")
-                    elif gap["gap_hours"] < 24:
+                    elif gap.get("gap_hours", 0) < 24:
                         st.caption(f"🟡 {sym} — {gap['label']}")
                     else:
                         st.caption(f"🔴 {sym} — {gap['label']}")
-                except:
-                    st.caption(f"📊 {sym}")
-            else:
-                st.caption(f"📊 {sym} — not loaded")
+                else:
+                    st.caption(f"📊 {sym} — not loaded")
+            except Exception as loop_err:
+                st.caption(f"📊 {sym} (Status error)")
+                # Don't crash the sidebar even if status check fails
 
         with col_btn:
-            if st.button(f"🔄 Sync", key=f"sync_{sym}", width="stretch"):
-                if not hf_repo or not hf_token:
-                    st.error("HF_REPO_ID or HF_TOKEN missing from secrets.toml")
-                elif not mt5_url:
-                    st.error("Enter MT5 server URL first")
-                else:
-                    from data_sync import sync_symbol
-                    with st.spinner(f"Syncing {sym}…"):
-                        try:
+            try:
+                if st.button(f"🔄 Sync", key=f"sync_{sym}", width="stretch"):
+                    if not hf_repo or not hf_token:
+                        st.error("Credential Error")
+                    elif not IS_CLOUD and not mt5_url:
+                        st.error("Enter MT5 setup")
+                    else:
+                        from data_sync import sync_symbol
+                        with st.spinner(f"Syncing…"):
                             updated_df, stats = sync_symbol(hf_repo, sym, hf_token, mt5_url, mt5_token)
                             st.session_state[f"df_{sym}"] = updated_df
-                            if stats["status"] == "already_fresh":
-                                st.success(f"✅ {sym} already up to date")
-                            else:
-                                st.success(f"✅ {sym}: +{stats['new_rows']} rows synced")
-                        except Exception as e:
-                            st.error(f"❌ {sym} sync failed: {e}")
+                            st.success(f"✅ {sym} ok")
+            except Exception as sync_err:
+                st.error("Sync Errored")
 
     # --- ⚡ AUTO-SYNC CONTROLLER ---
     st.markdown("---")

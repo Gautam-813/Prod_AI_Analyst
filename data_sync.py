@@ -222,25 +222,33 @@ def ping_mt5_server(server_url: str, mt5_token: str = "") -> dict:
 def get_gap_info(df):
     """
     Calculates the gap between the last candle in the dataframe and now.
+    Uses UTC for Cloud safety.
     """
-    if df is None or df.empty:
-        return {"gap_hours": 0, "label": "No Data"}
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return {"gap_hours": 0, "label": "No Data", "is_fresh": False}
     
     try:
-        # Convert 'time' to datetime if it isn't already
-        last_time = pd.to_datetime(df['time'].iloc[-1])
-        now = datetime.now()
+        # Find time column flexibly
+        time_col = next((c for c in df.columns if c.lower() in ("time", "timestamp", "date")), None)
+        if not time_col: return {"gap_hours": 0, "label": "Invalid Format", "is_fresh": False}
+
+        # Force UTC conversion
+        last_time = pd.to_datetime(df[time_col].iloc[-1], utc=True)
+        now = datetime.now(timezone.utc)
+        
         diff = now - last_time
         gap_hours = diff.total_seconds() / 3600
         
-        if gap_hours < 1: label = "Up to date"
-        elif gap_hours < 24: label = f"{int(gap_hours)} hours"
-        else: label = f"{int(gap_hours/24)} days"
+        is_fresh = gap_hours < 0.25 # 15 min freshness
         
-        return {"gap_hours": gap_hours, "label": label, "last_time": last_time}
+        if gap_hours < 1: label = "Up to date"
+        elif gap_hours < 24: label = f"{int(gap_hours)} hours ago"
+        else: label = f"{int(gap_hours/24)} days ago"
+        
+        return {"gap_hours": gap_hours, "label": label, "last_time": last_time, "is_fresh": is_fresh}
     except Exception as e:
-        print(f"Gap check error: {e}")
-        return {"gap_hours": 0, "label": "Error checking"}
+        print(f"DEBUG: Gap check error: {e}")
+        return {"gap_hours": 0, "label": "Clock error", "is_fresh": False}
 def sync_yahoo_symbol(repo_id: str, symbol: str, hf_token: str, 
                       period="max", interval="1d") -> tuple[pd.DataFrame, dict]:
     """
