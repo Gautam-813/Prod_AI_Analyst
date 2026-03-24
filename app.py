@@ -182,7 +182,7 @@ if not check_password():
 with st.sidebar:
     st.header("⚙️ Configuration")
     provider_choice = st.selectbox("Select AI Provider", [
-        "NVIDIA", "Groq", "OpenRouter", "OpenRouter (Free)", "Gemini", "GitHub Models", "Cerebras", "Bytez"
+        "NVIDIA", "Groq", "OpenRouter", "OpenRouter (Free)", "Gemini", "GitHub Models", "Cerebras", "Bytez", "Completions"
     ])
     
     # Leave value empty to prevent dots being shown in the DOM (security measure)
@@ -194,6 +194,8 @@ with st.sidebar:
         secret_key_name = "OPEN_ROUTER_API_KEY"
     elif provider_choice == "GitHub Models":
         secret_key_name = "GITHUB_API_KEY"
+    elif provider_choice == "Completions":
+        secret_key_name = "Completions"
     
     api_key_to_use = input_api_key if input_api_key else st.secrets.get(secret_key_name, "")
     
@@ -263,6 +265,16 @@ with st.sidebar:
             "Qwen/Qwen1.5-72B-Chat"
         ])
         base_url = "https://api.bytez.com/models/v2/openai/"
+    elif provider_choice == "Completions":
+        model_choice = st.selectbox("Select Model", [
+            "gpt-4o",
+            "gpt-4o-mini",
+            "gpt-4-turbo",
+            "gpt-3.5-turbo",
+            "claude-3-5-sonnet-20240620",
+            "claude-3-opus-20240229"
+        ])
+        base_url = "https://api.completions.com/v1"
 
     enable_thinking = st.checkbox("Enable Thinking Mode", value=True)
     show_debug = st.checkbox("Show AI Trace (Debug)", value=False)
