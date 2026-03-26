@@ -113,6 +113,11 @@ class QuickFetchRequest(BaseModel):
     preset: str = "yesterday_to_now"  # yesterday_to_now, last_24h, last_week, today, last_hour
     timeframe: str = "1m"
 
+class FetchLatestRequest(BaseModel):
+    symbol: str
+    timeframe: str
+    count: int = 500
+
 # ============================================================================
 # MT5 Provider Class (unchanged from original)
 # ============================================================================
@@ -390,7 +395,16 @@ def quick_fetch(req: QuickFetchRequest, token: Annotated[str, Depends(verify_tok
     if not provider.initialized:
         raise HTTPException(status_code=400, detail="MT5 not initialized")
 
-    now = datetime.now(pytz.UTC)
+    # 📡 PULSE CHECK: Get Terminal/Broker "Now" (The only source of truth)
+    sym_clean = provider.resolve_symbol_name(req.symbol)
+    tick = mt5.symbol_info_tick(sym_clean)
+    if tick:
+        # Get terminal time from last tick
+        now = datetime.fromtimestamp(tick.time, pytz.UTC)
+    else:
+        # Fallback to UTC only if market is closed or symbol unknown
+        now = datetime.now(pytz.UTC)
+
     presets = {
         'yesterday_to_now': (now - timedelta(days=1), now),
         'last_24h':         (now - timedelta(hours=24), now),
@@ -427,6 +441,52 @@ def quick_fetch(req: QuickFetchRequest, token: Annotated[str, Depends(verify_tok
             "start": df['time'].iloc[0],
             "end": df['time'].iloc[-1]
         },
+        "data": data_records
+    }
+
+@app.post("/data/fetch-latest")
+def fetch_latest(req: FetchLatestRequest, token: Annotated[str, Depends(verify_token)]):
+    """
+    Fetch the LAST 'count' candles directly by position (0 = latest).
+    This ignores system clock differences between broker and local server.
+    """
+    if not provider.initialized:
+        raise HTTPException(status_code=400, detail="MT5 not initialized")
+    
+    symbol = provider.resolve_symbol_name(req.symbol)
+    if not mt5.symbol_select(symbol, True):
+        raise HTTPException(status_code=404, detail=f"Symbol {symbol} not found")
+        
+    timeframe_map = {
+        '1m':  mt5.TIMEFRAME_M1,
+        '5m':  mt5.TIMEFRAME_M5,
+        '15m': mt5.TIMEFRAME_M15,
+        '30m': mt5.TIMEFRAME_M30,
+        '1h':  mt5.TIMEFRAME_H1,
+        '4h':  mt5.TIMEFRAME_H4,
+        '1d':  mt5.TIMEFRAME_D1,
+        '1w':  mt5.TIMEFRAME_W1,
+        '1M':  mt5.TIMEFRAME_MN1
+    }
+    tf = timeframe_map.get(req.timeframe, mt5.TIMEFRAME_M1)
+    
+    # Position-based fetch: start=0, count=req.count
+    rates = mt5.copy_rates_from_pos(symbol, tf, 0, req.count)
+    if rates is None or len(rates) == 0:
+        raise HTTPException(status_code=500, detail="No data available from MT5 bridge")
+        
+    df = pd.DataFrame(rates)
+    df['time'] = pd.to_datetime(df['time'], unit='s')
+    df['time'] = df['time'].dt.strftime('%Y-%m-%d %H:%M:%S')
+    data_records = df.to_dict('records')
+    
+    print(f"🔥 Position Fetch: {req.symbol} | Start=0 | Count={req.count}")
+    
+    return {
+        "success": True,
+        "symbol": req.symbol,
+        "timeframe": req.timeframe,
+        "rows": len(data_records),
         "data": data_records
     }
 

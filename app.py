@@ -29,6 +29,7 @@ from datetime import datetime, timezone
 import contextlib
 import io
 from streamlit_autorefresh import st_autorefresh
+from data_sync import pull_mt5_latest, ping_mt5_server
 
 def execute_generated_code(code, df):
     """Executes AI-generated Python code within a safe, isolated quant environment."""
@@ -68,11 +69,12 @@ def process_ai_query(prompt, df, model_choice, api_key, model_provider, history_
             system_prompt = f"""
             You are a Lead Quant in 2026. Use the provided DataFrame 'df' for your analysis.
             SCHEMA: {metadata}
-            SAMPLES: {df.head(2).to_string()}
+            LATEST_CANDLE_RECORDED: {df['time'].iloc[-1] if not df.empty and 'time' in df.columns else 'N/A'}
+            SAMPLES (Last 5 Rows): {df.tail(5).to_string()}
             
-            RULES:
-            1. Provide executable Python code in ```python blocks.
-            2. Explain your reasoning in detail BEFORE the code.
+            RULES (STRICT):
+            1. Analyze only based on the provided data available in 'df'. Ignore local system time.
+            2. Provide executable Python code in ```python blocks.
             3. Use 'st.write()', 'st.plotly_chart()' for results.
             """
             
@@ -746,7 +748,7 @@ if "Historical" in view_mode:
                 time_cols = [c for c in current_df.columns if 'time' in c.lower() or 'date' in c.lower()]
                 if time_cols and lookback_choice != "All Data":
                     time_col = time_cols[0]
-                    current_df[time_col] = pd.to_datetime(current_df[time_col], utc=True, errors='coerce')
+                    current_df[time_col] = pd.to_datetime(current_df[time_col], utc=False, errors='coerce')
                     max_time = current_df[time_col].max()
                     
                     if lookback_choice == "Last 7 Days":
@@ -835,7 +837,6 @@ elif "Live" in view_mode:
                                      key="live_mt5_token")
             
         if st.button("🔌 Establish Broker Bridge", width="stretch"):
-            from data_sync import ping_mt5_server
             with st.spinner("Pinging local server..."):
                 res = ping_mt5_server(mt5_url_in, mt5_tok_in)
                 if res["reachable"] and res["mt5_initialized"]:
@@ -849,21 +850,21 @@ elif "Live" in view_mode:
 
     # ── STEP 2: Main Terminal (Only if bridge is active) ──────────────────
     if st.session_state.get("mt5_connected"):
-        st_col1, st_col2, st_col3 = st.columns([2, 1, 2])
+        st_col1, st_col2, st_col3, st_col4 = st.columns([1.5, 1, 1.5, 1.5])
         with st_col1: l_sym = st.selectbox("Symbol", ["XAUUSD", "EURUSD", "DXY"], key="l_sym")
         with st_col2: l_tf = st.selectbox("TF", ["1m", "5m", "15m", "1h"], key="l_tf")
-        with st_col3: 
+        with st_col3: l_count = st.number_input("Lookback Bars", value=500, min_value=100, max_value=5000, step=100, key="l_count")
+        with st_col4: 
             st.write("")
             live_active = st.toggle("Enable Continuous Feed 📡", value=False)
 
         if st.button("🔄 Start/Sync Live Feed") or live_active:
-            from data_sync import pull_mt5_window
             m_url = st.session_state.get("live_mt5_url", "http://localhost:5000")
             m_tok = st.session_state.get("live_mt5_token", st.secrets.get("MT5_API_TOKEN", "impulse_secure_2026"))
             if live_active: st_autorefresh(interval=60 * 1000, key="live_refresh")
             
             with st.spinner("Streaming..."):
-                df_l = pull_mt5_window(m_url, l_sym, l_tf, 500, m_tok)
+                df_l = pull_mt5_latest(m_url, l_sym, l_tf, l_count, m_tok)
                 if not df_l.empty:
                     st.session_state.df_live = df_l
                     st.toast(f"📈 {l_sym} Live Updated: {df_l['time'].iloc[-1].strftime('%H:%M:%S')}")

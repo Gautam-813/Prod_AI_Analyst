@@ -129,6 +129,22 @@ def fetch_delta_from_mt5(server_url: str, symbol: str,
     except Exception as e:
         raise RuntimeError(f"[MT5 Fetch] {e}")
 
+def pull_mt5_latest(server_url: str, symbol: str, timeframe: str, count: int = 500, mt5_token: str = "") -> pd.DataFrame:
+    """Fetch the absolute latest N candles directly from MT5 memory by position (0=latest)."""
+    try:
+        payload = {"symbol": symbol, "timeframe": timeframe, "count": count}
+        headers = {"X-MT5-Token": mt5_token}
+        resp = requests.post(f"{server_url.rstrip('/')}/data/fetch-latest", json=payload, headers=headers, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+        if not data.get("success"): return pd.DataFrame()
+        df = pd.DataFrame(data["data"])
+        if not df.empty: df["time"] = pd.to_datetime(df["time"])
+        return df
+    except Exception as e:
+        print(f"Latest Pull Error: {e}")
+        return pd.DataFrame()
+
 # -----------------------------------------------------------------------
 # 5. Merge new rows into existing DataFrame and push back to HF Hub
 # -----------------------------------------------------------------------
