@@ -68,7 +68,33 @@ def get_last_timestamp(df: pd.DataFrame) -> datetime:
     return last
 
 # -----------------------------------------------------------------------
-# 3. Fetch ONLY the missing candles from the MT5 Data Server
+# 3. Get data gap info (for display in sidebar)
+# -----------------------------------------------------------------------
+def get_gap_info(df: pd.DataFrame) -> dict:
+    """Return a dict with last_timestamp, gap_hours, and a human label."""
+    now = datetime.now(timezone.utc)
+    last_ts = get_last_timestamp(df)
+    gap_seconds = (now - last_ts).total_seconds()
+    gap_hours   = gap_seconds / 3600
+    gap_days    = gap_hours   / 24
+
+    if gap_hours < 1:
+        label = f"{int(gap_seconds / 60)} minutes old"
+    elif gap_hours < 24:
+        label = f"{gap_hours:.1f} hours old"
+    else:
+        label = f"{gap_days:.1f} days old"
+
+    return {
+        "last_timestamp": last_ts,
+        "gap_hours":      round(gap_hours, 2),
+        "gap_days":       round(gap_days, 2),
+        "label":          label,
+        "is_fresh":       gap_hours < 0.1   # < 6 minutes → no sync needed
+    }
+
+# -----------------------------------------------------------------------
+# 4. Fetch ONLY the missing candles from the MT5 Data Server
 # -----------------------------------------------------------------------
 def fetch_delta_from_mt5(server_url: str, symbol: str,
                           from_time: datetime, to_time: datetime,

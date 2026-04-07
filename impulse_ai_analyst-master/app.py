@@ -25,336 +25,29 @@ import quantstats as qs
 import duckdb
 import polars as pl
 import xgboost as xgb
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 import contextlib
 import io
 from streamlit_autorefresh import st_autorefresh
 from data_sync import pull_mt5_latest, ping_mt5_server
 
-# ============================================================================
-# Trade Execution & Management Helpers
-# ============================================================================
-# --- PERSISTENT CONNECTION POOL (ASAP Speed) ---
-if 'api_session' not in st.session_state:
-    st.session_state.api_session = requests.Session()
-
-def get_session():
-    return st.session_state.api_session
-
-# --- CALLBACK STATES ---
-if 'executing' not in st.session_state:
-    st.session_state.executing = False
-if 'last_exec_msg' not in st.session_state:
-    st.session_state.last_exec_msg = ""
-
-# --- HIGH-SPEED CACHING ---
-@st.cache_data(ttl=3600)
-def get_cached_symbol_info(m_url, m_tok, symbol):
-    """Cache static symbol specs to avoid redundant API calls."""
-    try:
-        headers = {"X-MT5-Token": m_tok}
-        resp = get_session().get(f"{m_url.rstrip('/')}/symbol/info/{symbol}", headers=headers, timeout=5)
-        resp.raise_for_status()
-        return resp.json()
-    except: return None
-
-@st.cache_data(ttl=600)
-def get_cached_account_info(m_url, m_tok):
-    """Cache account settings like leverage and currency."""
-    try:
-        headers = {"X-MT5-Token": m_tok}
-        resp = get_session().get(f"{m_url.rstrip('/')}/account/info", headers=headers, timeout=5)
-        resp.raise_for_status()
-        return resp.json()
-    except: return None
-
-def place_mt5_order(mt5_url, mt5_token, symbol, action, volume, sl=None, tp=None, price=None, magic=123456, comment="[IMPULSE_V2]"):
-    headers = {"X-MT5-Token": mt5_token}
-    payload = {
-        "symbol": symbol, "action": action.upper(), "volume": volume,
-        "sl": sl, "tp": tp, "price": price, "magic": magic, "comment": comment
+def execute_generated_code(code, df):
+    """Executes AI-generated Python code within a safe, isolated quant environment."""
+    env = {
+        'st': st, 'pd': pd, 'np': np, 'px': px, 'go': go, 'plt': plt,
+        'sns': sns, 'df': df, 're': re, 'math': math, 'scipy': scipy,
+        'pyg': pyg if PYG_AVAILABLE else None, 'ta': ta, 'sm': sm,
+        'qs': qs, 'duck': duckdb, 'pl': pl, 'alt': alt, 'xgb': xgb,
+        'datetime': datetime, 'timezone': timezone
     }
-    resp = get_session().post(f"{mt5_url.rstrip('/')}/order/place", json=payload, headers=headers, timeout=10)
-    resp.raise_for_status()
-    return resp.json()
-
-def close_mt5_position(mt5_url, mt5_token, ticket, volume=None, comment="[IMPULSE_V2]"):
-    headers = {"X-MT5-Token": mt5_token}
-    payload = {"ticket": ticket, "volume": volume, "comment": comment}
-    resp = get_session().post(f"{mt5_url.rstrip('/')}/order/close", json=payload, headers=headers, timeout=10)
-    resp.raise_for_status()
-    return resp.json()
-
-def modify_mt5_position(mt5_url, mt5_token, ticket, sl=None, tp=None):
-    headers = {"X-MT5-Token": mt5_token}
-    payload = {"ticket": ticket, "sl": sl, "tp": tp}
-    resp = get_session().post(f"{mt5_url.rstrip('/')}/order/modify", json=payload, headers=headers, timeout=10)
-    resp.raise_for_status()
-    return resp.json()
-
-def fetch_open_positions(mt5_url, mt5_token):
-    headers = {"X-MT5-Token": mt5_token}
-    resp = get_session().get(f"{mt5_url.rstrip('/')}/positions/summary", headers=headers, timeout=5)
-    resp.raise_for_status()
-    return resp.json()
-
-def fetch_trade_history(mt5_url, mt5_token, hours=24):
-    headers = {"X-MT5-Token": mt5_token}
-    resp = get_session().get(f"{mt5_url.rstrip('/')}/trades/history", params={"hours": hours}, headers=headers, timeout=5)
-    resp.raise_for_status()
-    return resp.json()
-
-def calculate_lot_size_risk(account_balance, risk_percent, entry_price, sl_price, tick_value, point):
-    """Calculate lot size based on risk % and SL distance."""
-    if entry_price is None or sl_price is None or tick_value is None or point is None or point == 0:
-        return None
-    risk_amount = account_balance * (risk_percent / 100.0)
-    sl_distance_points = abs(entry_price - sl_price) / point
-    if sl_distance_points == 0:
-        return None
-    lot = risk_amount / (sl_distance_points * tick_value)
-    return round(max(lot, 0.01), 2)
-
-def _repair_json(text):
-    """Fix common AI JSON mistakes: missing commas, trailing commas, unquoted values."""
-    # Fix missing commas between key-value pairs: "key":value\n"key2"
-    text = re.sub(r'("[\w_]+")\s*:\s*("[^"]*"|-?\d+\.?\d*|true|false|null)\s*\n\s*(")', r'\1: \2,\n  \3', text)
-    # Fix trailing commas before closing brace
-    text = re.sub(r',\s*}', '}', text)
-    text = re.sub(r',\s*]', ']', text)
-    return text
-
-def detect_trade_setup(text):
-    """Detect and parse a TRADE_SETUP JSON block from AI response."""
-    json_pattern = r"```json\s*(.*?)\s*```"
-    blocks = re.findall(json_pattern, text, re.S | re.I)
-    for block in blocks:
+    output = io.StringIO()
+    plt.close('all')
+    with contextlib.redirect_stdout(output):
         try:
-            data = json.loads(block)
-            if isinstance(data, dict) and data.get("action") == "TRADE_SETUP":
-                return data
-        except json.JSONDecodeError:
-            # Attempt repair
-            try:
-                repaired = _repair_json(block)
-                data = json.loads(repaired)
-                if isinstance(data, dict) and data.get("action") == "TRADE_SETUP":
-                    return data
-            except json.JSONDecodeError:
-                continue
-    try:
-        data = json.loads(text)
-        if isinstance(data, dict) and data.get("action") == "TRADE_SETUP":
-            return data
-    except json.JSONDecodeError:
-        try:
-            repaired = _repair_json(text)
-            data = json.loads(repaired)
-            if isinstance(data, dict) and data.get("action") == "TRADE_SETUP":
-                return data
-        except json.JSONDecodeError:
-            pass
-    return None
-
-def detect_trade_action(text):
-    """Detect and parse a TRADE_ACTION JSON block (CLOSE, MODIFY_SL, MODIFY_TP, etc.)."""
-    json_pattern = r"```json\s*(.*?)\s*```"
-    blocks = re.findall(json_pattern, text, re.S | re.I)
-    for block in blocks:
-        try:
-            data = json.loads(block)
-            if isinstance(data, dict) and data.get("action") in ("CLOSE_POSITION", "MODIFY_SL", "MODIFY_TP", "MODIFY_SLTP", "ADD_TO_POSITION"):
-                return data
-        except json.JSONDecodeError:
-            try:
-                repaired = _repair_json(block)
-                data = json.loads(repaired)
-                if isinstance(data, dict) and data.get("action") in ("CLOSE_POSITION", "MODIFY_SL", "MODIFY_TP", "MODIFY_SLTP", "ADD_TO_POSITION"):
-                    return data
-            except json.JSONDecodeError:
-                continue
-    return None
-
-def build_trade_context(mt5_url, mt5_token):
-    """Build [ACTIVE TRADE CONTEXT] block for AI prompt injection."""
-    lines = []
-    try:
-        summary = fetch_open_positions(mt5_url, mt5_token)
-        if summary.get("positions"):
-            lines.append("[ACTIVE TRADE CONTEXT]")
-            for pos in summary["positions"]:
-                lines.append(
-                    f"Ticket: {pos['ticket']} | {pos['symbol']} {pos['direction']} | "
-                    f"Entry: {pos['entry_price']} | Current: {pos['current_price']} | "
-                    f"P&L: ${pos['profit']:.2f} | SL: {pos['sl']} | TP: {pos['tp']}"
-                )
-            lines.append(f"Account: Balance ${summary['balance']:.2f} | Equity ${summary['equity']:.2f} | Margin Level: {summary['margin_level']:.1f}%")
-    except Exception:
-        pass
-
-    try:
-        history = fetch_trade_history(mt5_url, mt5_token, hours=24)
-        if history.get("deals"):
-            lines.append("[RECENT CLOSED TRADES (Last 24h)]")
-            for deal in history["deals"]:
-                if deal.get("entry") == "CLOSE":
-                    lines.append(
-                        f"Ticket: {deal['ticket']} | {deal['symbol']} {deal['direction']} | "
-                        f"Exit: {deal['price']} | P&L: ${deal['profit']:.2f} | Comment: {deal.get('comment', '')}"
-                    )
-    except Exception:
-        pass
-
-    return "\n".join(lines)
-
-# ============================================================================
-# ⚡ HIGH-SPEED CALLBACK SYSTEM (V2.7)
-# ============================================================================
-def on_execute_market_cb(m_url, m_tok, symbol, action, lot, sl, tp):
-    """Callback for instant market execution."""
-    st.session_state.executing = True
-    try:
-        sl_val = sl if sl > 0 else None
-        tp_val = tp if tp > 0 else None
-        result = place_mt5_order(m_url, m_tok, symbol, action, lot, sl=sl_val, tp=tp_val)
-        st.session_state.last_exec_msg = f"✅ Market {action} #{result.get('ticket')} Successful!"
-        st.toast(st.session_state.last_exec_msg)
-    except Exception as e:
-        st.session_state.last_exec_msg = f"❌ Market Order Failed: {e}"
-        st.toast(st.session_state.last_exec_msg)
-    st.session_state.executing = False
-
-def on_execute_pending_cb(m_url, m_tok, symbol, direction, entry, lot, sl, tp):
-    """Callback for smart pending execution."""
-    st.session_state.executing = True
-    try:
-        # Resolve current prices ASAP
-        live_tick = get_session().get(f"{m_url.rstrip('/')}/symbol/info/{symbol}", 
-                                   headers={"X-MT5-Token": m_tok}).json()
-        ask, bid = live_tick.get("ask"), live_tick.get("bid")
-        
-        if not (entry and ask and bid):
-            st.session_state.last_exec_msg = "❌ Pending Error: Price data unavailable."
-        else:
-            smart_action = ""
-            if direction.upper() == "BUY":
-                smart_action = "BUY_LIMIT" if entry < ask else "BUY_STOP"
-            else:
-                smart_action = "SELL_LIMIT" if entry > bid else "SELL_STOP"
-            
-            sl_val = sl if sl > 0 else None
-            tp_val = tp if tp > 0 else None
-            result = place_mt5_order(m_url, m_tok, symbol, smart_action, lot, sl=sl_val, tp=tp_val, price=entry)
-            st.session_state.last_exec_msg = f"✅ {smart_action} #{result.get('ticket')} Placed!"
-            st.toast(st.session_state.last_exec_msg)
-    except Exception as e:
-        st.session_state.last_exec_msg = f"❌ Pending Order Failed: {e}"
-        st.toast(st.session_state.last_exec_msg)
-    st.session_state.executing = False
-
-def on_close_position_cb(m_url, m_tok, ticket):
-    """Callback for instant position closure."""
-    try:
-        result = close_mt5_position(m_url, m_tok, ticket)
-        st.toast(f"✅ Position #{ticket} Closed!")
-    except Exception as e:
-        st.toast(f"❌ Close failed: {e}")
-
-def on_modify_position_cb(m_url, m_tok, ticket, sl, tp):
-    """Callback for instant SL/TP modification."""
-    try:
-        # Use simple numeric inputs as floats
-        sl_val = float(sl) if sl and float(sl) > 0 else None
-        tp_val = float(tp) if tp and float(tp) > 0 else None
-        result = modify_mt5_position(m_url, m_tok, ticket, sl=sl_val, tp=tp_val)
-        st.toast(f"✅ Position #{ticket} Modified!")
-    except Exception as e:
-        st.toast(f"❌ Modify failed: {e}")
-
-def render_trade_card(setup, mt5_url, mt5_token, card_id="default"):
-    """Render an interactive Trade Execution Card from AI setup JSON with unique keys."""
-    symbol = setup.get("symbol", "XAUUSD")
-    direction = setup.get("direction", "BUY")
-    order_type_raw = setup.get("order_type", "market")
-    entry = setup.get("entry_price")
-    sl = setup.get("stop_loss")
-    tp = setup.get("take_profit")
-    lot = setup.get("lot_size", 0.10)
-    rr = setup.get("risk_reward", 0)
-    reasoning = setup.get("reasoning", "")
-
-    badge = "🟢 BUY" if direction.upper() == "BUY" else "🔴 SELL"
-    st.markdown(f"---")
-    st.markdown(f"#### {badge} Trade Setup — {symbol}")
-    if reasoning:
-        st.caption(f"📝 {reasoning}")
-
-    c1, c2, c3, c4, c5 = st.columns(5)
-    with c1:
-        use_ai_sltp = st.session_state.get("trade_ai_sltp", True)
-        card_entry = st.number_input("Entry", value=float(entry) if entry else 0.0, step=0.01, key=f"card_entry_{symbol}_{card_id}")
-    with c2:
-        card_sl = st.number_input("SL", value=float(sl) if sl else 0.0, step=0.01, disabled=use_ai_sltp, key=f"card_sl_{symbol}_{card_id}")
-    with c3:
-        card_tp = st.number_input("TP", value=float(tp) if tp else 0.0, step=0.01, disabled=use_ai_sltp, key=f"card_tp_{symbol}_{card_id}")
-    with c4:
-        lot_mode = st.session_state.get("trade_lot_mode", False)
-        if lot_mode:
-            risk_pct = st.session_state.get("trade_risk_pct", 1.0)
-            st.number_input("Risk %", value=risk_pct, step=0.1, disabled=True, key=f"card_risk_{symbol}_{card_id}")
-            card_lot = lot
-        else:
-            card_lot = st.number_input("Lot Size", value=float(lot), min_value=0.01, step=0.01, key=f"card_lot_{symbol}_{card_id}")
-    with c5:
-        st.metric("R:R Ratio", f"{rr:.2f}" if rr else "N/A")
-
-    # --- SMART ACTION SELECTION (CALLBACK-BASED) ---
-    col_a, col_b, col_c = st.columns([1, 1, 0.5])
-    
-    with col_a:
-        st.button(f"🚀 Market Execute", type="primary", use_container_width=True, 
-                  key=f"mkt_exec_{symbol}_{direction}_{card_id}",
-                  on_click=on_execute_market_cb,
-                  args=(mt5_url, mt5_token, symbol, direction.upper(), card_lot, card_sl, card_tp))
-
-    with col_b:
-        st.button(f"🕒 Smart Pending", type="secondary", use_container_width=True, 
-                  key=f"pnd_exec_{symbol}_{direction}_{card_id}",
-                  on_click=on_execute_pending_cb,
-                  args=(mt5_url, mt5_token, symbol, direction.upper(), card_entry, card_lot, card_sl, card_tp))
-
-    with col_c:
-        if st.button("❌", use_container_width=True, key=f"dismiss_{symbol}_{direction}_{card_id}"):
-            pass
-
-def render_action_card(action, mt5_url, mt5_token):
-    """Render an Action Card for AI-suggested trade management."""
-    action_type = action.get("action", "")
-    ticket = action.get("ticket")
-    reasoning = action.get("reasoning", "")
-
-    if action_type == "CLOSE_POSITION":
-        st.markdown(f"---")
-        st.markdown(f"#### 🛡️ AI Suggestion: Close Position #{ticket}")
-        st.caption(f"📝 {reasoning}")
-        st.button(f"✅ Close Position #{ticket}", type="primary", key=f"ai_close_{ticket}",
-                  on_click=on_close_position_cb, args=(mt5_url, mt5_token, ticket))
-        if st.button("❌ Ignore", key=f"ignore_close_{ticket}"):
-            pass
-
-    elif action_type in ("MODIFY_SL", "MODIFY_TP", "MODIFY_SLTP"):
-        new_sl = action.get("new_sl") or action.get("sl")
-        new_tp = action.get("new_tp") or action.get("tp")
-        st.markdown(f"---")
-        st.markdown(f"#### 🛡️ AI Suggestion: Modify Position #{ticket}")
-        changes = []
-        if new_sl: changes.append(f"SL → {new_sl}")
-        if new_tp: changes.append(f"TP → {new_tp}")
-        st.caption(f"📝 {reasoning} ({', '.join(changes)})")
-        st.button(f"✅ Apply Changes", type="primary", key=f"ai_modify_{ticket}",
-                  on_click=on_modify_position_cb, args=(mt5_url, mt5_token, ticket, new_sl, new_tp))
-        if st.button("❌ Ignore", key=f"ignore_modify_{ticket}"):
-            pass
+            exec(code, env)
+            return output.getvalue(), None
+        except Exception as e:
+            return output.getvalue(), str(e)
 
 def process_ai_query(prompt, df, model_choice, api_key, model_provider, history_key="messages", base_url=None, snapshot=None):
     """Handles professional quantitative analysis queries using multi-modal AI reasoning."""
@@ -383,16 +76,6 @@ def process_ai_query(prompt, df, model_choice, api_key, model_provider, history_
             1. Analyze only based on the provided data available in 'df'. Ignore local system time.
             2. Provide executable Python code in ```python blocks.
             3. Use 'st.write()', 'st.plotly_chart()' for results.
-             4. If you identify a trade opportunity, output a JSON block in ```json format:
-               ```json
-               {{"action": "TRADE_SETUP", "symbol": "XAUUSD", "direction": "BUY", "order_type": "market", "entry_price": 2345.50, "stop_loss": 2338.00, "take_profit": 2360.00, "lot_size": 0.10, "risk_reward": 1.93, "reasoning": "Brief explanation"}}
-               ```
-               IMPORTANT: JSON must be valid — every key-value pair must have a comma after it except the last one.
-             5. If analyzing an open position, suggest management via JSON:
-               ```json
-               {{"action": "MODIFY_SLTP", "ticket": 123456, "new_sl": 2345.50, "new_tp": 2370.00, "reasoning": "Trail SL to lock profit"}}
-               ```
-               Actions: CLOSE_POSITION, MODIFY_SL, MODIFY_TP, MODIFY_SLTP, ADD_TO_POSITION
             """
             
             # Robust key/client handling
@@ -437,16 +120,6 @@ def process_ai_query(prompt, df, model_choice, api_key, model_provider, history_
                 msg_to_store = {"role": "assistant", "content": full_txt}
                 if final_code: msg_to_store["code"] = final_code
                 if final_stdout: msg_to_store["exec_result"] = final_stdout
-                
-                # 🔍 TRADE SETUP DETECTION
-                setup = detect_trade_setup(full_txt)
-                if setup:
-                    msg_to_store["detected_setup"] = setup
-                
-                # 🔍 TRADE ACTION DETECTION
-                action = detect_trade_action(full_txt)
-                if action:
-                    msg_to_store["detected_action"] = action
                 
                 # 🛡️ GOLDEN VAULT: Store snapshot with a unique ID, not inside the message
                 if snapshot is not None:
@@ -914,9 +587,7 @@ def process_data(uploaded_file):
         st.error(f"☢️ Nuclear Data Clean Error: {e}")
         return None
 
-# ============================================================================
 # Streamlit wrapper that auto-sanitizes DataFrames for Arrow compatibility
-# ============================================================================
 class _SafeStreamlit:
     def __getattr__(self, name):
         return getattr(st, name)
@@ -933,14 +604,15 @@ class _SafeStreamlit:
 # Code Execution Engine
 def execute_generated_code(code, df):
     safe_st = _SafeStreamlit()
+    # Prepare environment
     env = {
-        'pd': pd,
+        'pd': pd, 
         'np': np,
-        'px': px,
-        'go': go,
-        'plt': plt,
+        'px': px, 
+        'go': go, 
+        'plt': plt, 
         'sns': sns,
-        'st': safe_st,
+        'st': safe_st, 
         'df': df,
         'math': math,
         'scipy': scipy,
@@ -955,6 +627,7 @@ def execute_generated_code(code, df):
         'xgb': xgb
     }
     output = io.StringIO()
+    # Close any existing plots
     plt.close('all')
     with contextlib.redirect_stdout(output):
         try:
@@ -963,150 +636,6 @@ def execute_generated_code(code, df):
         except Exception as e:
             return output.getvalue(), str(e)
 
-def calculate_session_performance(history_data):
-    """Analyze trade history to generate session performance metrics."""
-    deals = history_data.get("deals", [])
-    if not deals:
-        return None
-    
-    # Filter for closing deals only
-    closed_deals = [d for d in deals if d.get("entry") == "CLOSE"]
-    if not closed_deals:
-        return None
-    
-    total_pnl = sum(d.get("profit", 0) for d in closed_deals)
-    winning_deals = [d for d in closed_deals if d.get("profit", 0) > 0]
-    losing_deals = [d for d in closed_deals if d.get("profit", 0) <= 0]
-    
-    win_rate = (len(winning_deals) / len(closed_deals) * 100) if closed_deals else 0
-    
-    avg_win = sum(d.get("profit", 0) for d in winning_deals) / len(winning_deals) if winning_deals else 0
-    avg_loss = sum(d.get("profit", 0) for d in losing_deals) / len(losing_deals) if losing_deals else 0
-    
-    return {
-        "total_pnl": float(total_pnl),
-        "count": len(closed_deals),
-        "wins": len(winning_deals),
-        "losses": len(losing_deals),
-        "win_rate": float(win_rate),
-        "avg_win": float(avg_win),
-        "avg_loss": float(avg_loss),
-        "history": closed_deals
-    }
-
-def render_performance_tab(m_url, m_tok):
-    """Renders the dynamic filtering session performance dashboard."""
-    colA, colB = st.columns([4, 1])
-    with colA:
-        st.subheader("📊 Session Performance Vault")
-    with colB:
-        if st.button("🔄 Refresh History", width="stretch"):
-            pass # Button click will trigger fragment re-run naturally
-    
-    try:
-        history = fetch_trade_history(m_url, m_tok, hours=0) # 0 = Fetch all records 
-        deals = history.get("deals", [])
-        
-        if not deals:
-            st.info("No closed trades in the history. Start trading to see analytics!")
-            return
-
-        # Load into DataFrame for rapid filtering
-        df_hist = pd.DataFrame(deals)
-        df_hist['time'] = pd.to_datetime(df_hist['time'], errors='coerce')
-        df_hist['comment'] = df_hist['comment'].fillna("")
-
-        # --- DYNAMIC FILTERS UI ---
-        with st.expander("🔍 Filter History Vault", expanded=True):
-            f1, f2, f3, f4 = st.columns(4)
-            
-            # 1. Date Range Filters (Replaces Comment Filter)
-            today = datetime.now().date()
-            start_date = f1.date_input("Start Date", today - timedelta(days=7))
-            end_date = f2.date_input("End Date", today)
-            
-            # 2. Symbol Filter
-            all_symbols = ["All Symbols"] + sorted(list(df_hist['symbol'].unique()))
-            selected_symbol = f3.selectbox("Symbol", all_symbols, index=0)
-            
-            # 3. Direction Filter
-            selected_dir = f4.selectbox("Direction", ["All", "BUY", "SELL"], index=0)
-            
-        # Apply Logic
-        df_filtered = df_hist.copy()
-        
-        # Apply Date Logic
-        if start_date and end_date:
-            start_dt = pd.to_datetime(start_date)
-            end_dt = pd.to_datetime(end_date) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
-            df_filtered = df_filtered[(df_filtered['time'] >= start_dt) & (df_filtered['time'] <= end_dt)]
-            
-        if selected_symbol != "All Symbols":
-            df_filtered = df_filtered[df_filtered['symbol'] == selected_symbol]
-        if selected_dir != "All":
-            df_filtered = df_filtered[df_filtered['direction'] == selected_dir]
-            
-        if df_filtered.empty:
-            st.warning("No trades match the selected filters.")
-            return
-
-        # --- DYNAMIC METRICS CALCULATION ---
-        total_pnl = df_filtered['profit'].sum()
-        winning_deals = df_filtered[df_filtered['profit'] > 0]
-        losing_deals = df_filtered[df_filtered['profit'] <= 0]
-        
-        count_all = len(df_filtered)
-        count_wins = len(winning_deals)
-        count_losses = len(losing_deals)
-        
-        win_rate = (count_wins / count_all * 100) if count_all > 0 else 0
-        avg_win = winning_deals['profit'].mean() if not winning_deals.empty else 0
-        avg_loss = losing_deals['profit'].mean() if not losing_deals.empty else 0
-
-        # Top Level Metrics
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Net Profit", f"${total_pnl:,.2f}", delta=f"{total_pnl:.2f}")
-        m2.metric("Win Rate", f"{win_rate:.1f}%")
-        m3.metric("Total Trades", count_all)
-        m4.metric("Avg Win/Loss", f"${avg_win:.2f} / ${avg_loss:.2f}")
-
-        # Visualization
-        st.markdown("---")
-        col1, col2 = st.columns([2, 1])
-        
-        with col1:
-            st.caption("📈 Session Equity Growth (Filtered Trades)")
-            df_curve = df_filtered.sort_values('time').copy()
-            df_curve['cumulative_pnl'] = df_curve['profit'].cumsum()
-            
-            fig = px.line(df_curve, x='time', y='cumulative_pnl', 
-                          title="Realized P&L Curve",
-                          template="plotly_dark",
-                          labels={'cumulative_pnl': 'Profit ($)', 'time': 'Time'})
-            fig.update_traces(line_color='#00ff41', fill='tozeroy')
-            st.plotly_chart(fig, use_container_width=True)
-            
-        with col2:
-            st.caption("🎯 Win/Loss Distribution")
-            dist_fig = px.pie(values=[count_wins, count_losses], 
-                              names=['Wins', 'Losses'],
-                              color_discrete_sequence=['#00ff41', '#ff4b4b'],
-                              hole=0.4)
-            dist_fig.update_layout(template="plotly_dark", showlegend=False)
-            st.plotly_chart(dist_fig, use_container_width=True)
-
-        # Detailed History Table
-        st.markdown("---")
-        st.subheader("📜 Detailed Trade History")
-        
-        df_display = df_filtered[['ticket', 'symbol', 'direction', 'volume', 'price', 'profit', 'time', 'comment']].copy()
-        df_display = df_display.sort_values('time', ascending=False)
-        st.dataframe(make_arrow_safe(df_display), width="stretch")
-
-    except Exception as e:
-        st.error(f"Failed to load performance data: {e}")
-
-# ============================================================================
 # Main Application
 st.title("🏛️ NVIDIA NIM Professional Quant Station")
 
@@ -1325,7 +854,6 @@ elif "Live" in view_mode:
             
         if st.button("🔌 Establish Broker Bridge", width="stretch"):
             with st.spinner("Pinging local server..."):
-                from data_sync import ping_mt5_server
                 res = ping_mt5_server(mt5_url_in, mt5_tok_in)
                 if res["reachable"] and res["mt5_initialized"]:
                     st.session_state.mt5_connected = True
@@ -1338,198 +866,71 @@ elif "Live" in view_mode:
 
     # ── STEP 2: Main Terminal (Only if bridge is active) ──────────────────
     if st.session_state.get("mt5_connected"):
-        m_url = st.session_state.get("mt5_url", "http://localhost:5000")
-        m_tok = st.secrets.get("MT5_API_TOKEN", "impulse_secure_2026")
+        st_col1, st_col2, st_col3, st_col4 = st.columns([1.5, 1, 1.5, 1.5])
+        with st_col1: l_sym = st.selectbox("Symbol", ["XAUUSD", "EURUSD", "DXY"], key="l_sym")
+        with st_col2: l_tf = st.selectbox("TF", ["1m", "5m", "15m", "1h"], key="l_tf")
+        with st_col3: l_count = st.number_input("Lookback Bars", value=500, min_value=100, max_value=5000, step=100, key="l_count")
+        with st_col4: 
+            st.write("")
+            live_active = st.toggle("Enable Continuous Feed 📡", value=st.session_state.get("live_active_state", False), key="live_active_sync")
+            st.session_state.live_active_state = live_active
 
-        # ── MULTI-TAB ARCHITECTURE ────────────────────────────────────────
-        t_live, t_perf, t_intel = st.tabs(["📺 Live Terminal", "📜 Trade History", "🌐 Market Intel"])
-
-        with t_live:
-            # ── TRADE CONFIGURATION PANEL ──────────────────────────────────────
-            with st.expander("⚙️ Trade Configuration", expanded=False):
-                tc1, tc2, tc3 = st.columns(3)
-                with tc1:
-                    order_type = st.selectbox("Order Type", [
-                        "Market", "Buy Limit", "Sell Limit", "Buy Stop", "Sell Stop"
-                    ], key="trade_order_type")
-                with tc2:
-                    lot_mode = st.toggle("Auto Lot (Risk %)", value=False, key="trade_lot_mode")
-                    if lot_mode:
-                        risk_pct = st.number_input("Risk %", min_value=0.1, max_value=100.0, value=1.0, step=0.1, key="trade_risk_pct")
-                    else:
-                        manual_lot = st.number_input("Lot Size", min_value=0.01, max_value=100.0, value=0.10, step=0.01, key="trade_manual_lot")
-                with tc3:
-                    sl_tp_mode = st.toggle("Use AI SL/TP", value=True, key="trade_ai_sltp")
-
-            # ── CHART & FEED CONTROLS ──────────────────────────────────────────
-            st_col1, st_col2, st_col3, st_col4 = st.columns([1.5, 1, 1.5, 1.5])
-            with st_col1: l_sym = st.selectbox("Symbol", ["XAUUSD", "EURUSD", "DXY"], key="l_sym")
-            with st_col2: l_tf = st.selectbox("TF", ["1m", "5m", "15m", "1h"], key="l_tf")
-            with st_col3: l_count = st.number_input("Lookback Bars", value=500, min_value=100, max_value=5000, step=100, key="l_count")
-            with st_col4: 
-                st.write("")
-                live_active = st.toggle("Enable Continuous Feed 📡", value=st.session_state.get("live_active_state", False), key="live_active_sync")
-                st.session_state.live_active_state = live_active
-
-            # 🎯 SURGICAL FRAGMENT: Re-runs only the Chart area
-            @st.fragment(run_every=60 if live_active else None)
-            def live_chart_fragment(symbol, timeframe, count, active):
-                m_url_f = st.session_state.get("mt5_url", "http://localhost:5000")
-                m_tok_f = st.secrets.get("MT5_API_TOKEN", "impulse_secure_2026")
-                from data_sync import pull_mt5_latest
-                # Use directly outside to be safe
-                df_l = pull_mt5_latest(m_url_f, symbol, timeframe, count, m_tok_f)
-                if not df_l.empty:
-                    st.session_state.df_live = df_l
-                    st.subheader(f"📊 {symbol} — {timeframe} Real-Time Feed")
-                    last_bar = df_l.iloc[-1]
-                    t_str = last_bar['time'].strftime('%H:%M:%S') if hasattr(last_bar['time'], 'strftime') else str(last_bar['time'])
-                    m1, m2, m3, m4, m5 = st.columns(5)
-                    m1.metric("⏲️ Terminal Time", t_str)
-                    m2.metric("🟢 OPEN", f"{last_bar['open']:.5f}")
-                    m3.metric("📈 HIGH", f"{last_bar['high']:.5f}", delta=f"{(last_bar['high']-last_bar['open']):.5f}")
-                    m4.metric("📉 LOW",  f"{last_bar['low']:.5f}",  delta=f"{(last_bar['low']-last_bar['open']):.5f}")
-                    m5.metric("🎯 CURRENT", f"{last_bar['close']:.5f}", delta=f"{(last_bar['close']-last_bar['open']):.5f}")
-                    fig = go.Figure(data=[go.Candlestick(x=df_l['time'], open=df_l['open'], high=df_l['high'], low=df_l['low'], close=df_l['close'])])
-                    fig.update_layout(template="plotly_dark", height=500, margin=dict(l=10,r=10,t=10,b=10), showlegend=False)
-                    st.plotly_chart(fig, use_container_width=True)
-
-            live_chart_fragment(l_sym, l_tf, l_count, live_active)
-
-            @st.fragment(run_every=1000)
-            def position_manager_fragment():
-                pm_url = st.session_state.get("mt5_url", "http://localhost:5000")
-                pm_tok = st.secrets.get("MT5_API_TOKEN", "impulse_secure_2026")
-                try:
-                    summary = fetch_open_positions(pm_url, pm_tok)
-                except Exception: return
-                if "last_open_count" in st.session_state and "last_positions" in st.session_state:
-                    if summary.get("open_count", 0) < st.session_state.last_open_count:
-                        # Find which tickets were closed
-                        current_tickets = [p["ticket"] for p in summary.get("positions", [])]
-                        last_tickets = [p["ticket"] for p in st.session_state.last_positions]
-                        closed_tickets = [t for t in last_tickets if t not in current_tickets]
-                        
-                        try:
-                            # Fetch recent history to find details of the closed trade
-                            history = fetch_trade_history(pm_url, pm_tok, hours=1)
-                            deals = history.get("deals", [])
-                            for ticket in closed_tickets:
-                                # Find deal matching this order/ticket
-                                matching_deal = next((d for d in deals if d.get("ticket") == ticket and d.get("entry") == "CLOSE"), None)
-                                if matching_deal:
-                                    pnl = matching_deal.get("profit", 0)
-                                    sym = matching_deal.get("symbol", "Trade")
-                                    comm = matching_deal.get("comment", "").lower()
-                                    
-                                    # Detect if TP or SL hit
-                                    reason = ""
-                                    if "[tp]" in comm or "tp" in comm: reason = " (TP hit) 🎯"
-                                    elif "[sl]" in comm or "sl" in comm: reason = " (SL hit) 🛡️"
-                                    
-                                    prefix = "✅" if pnl >= 0 else "❌"
-                                    st.toast(f"{prefix} {sym} #{ticket} closed: ${pnl:+.2f}{reason}")
-                                else:
-                                    st.toast(f"🔔 Position #{ticket} closed! Check history for details.")
-                        except Exception:
-                            st.toast("🔔 A position has been closed! Check history for details.")
-                
-                st.session_state.last_open_count = summary.get("open_count", 0)
-                st.session_state.last_positions = summary.get("positions", [])
-                st.markdown("---")
-                st.subheader("📋 Active Positions")
-                bal = summary.get("balance", 0)
-                eq = summary.get("equity", 0)
-                ml = summary.get("margin_level", 0)
-                tp_val = summary.get("total_profit", 0)
-                oc = summary.get("open_count", 0)
-                am1, am2, am3, am4 = st.columns(4)
-                am1.metric("💰 Balance", f"${bal:,.2f}")
-                am2.metric("📊 Equity", f"${eq:,.2f}", delta=f"${eq - bal:,.2f}")
-                am3.metric("📈 Margin Level", f"{ml:.1f}%")
-                am4.metric("📦 Open Count", f"{oc}", delta=f"${tp_val:,.2f}", delta_color="normal" if tp_val >= 0 else "inverse")
-                positions = summary.get("positions", [])
-                if positions:
-                    for pos in positions:
-                        p_color = "🟢" if pos["profit"] >= 0 else "🔴"
-                        with st.container(border=True):
-                            pc1, pc2, pc3, pc4, pc5, pc6, pc7, pc8 = st.columns([1, 1.5, 0.8, 1, 1, 1, 1, 1.5])
-                            pc1.markdown(f"**{p_color} #{pos['ticket']}**")
-                            pc2.markdown(f"**{pos['symbol']}** {pos['direction']}")
-                            pc3.markdown(f"Vol: {pos['volume']}")
-                            pc4.markdown(f"Entry: {pos['entry_price']}")
-                            pc5.markdown(f"Current: {pos['current_price']}")
-                            pc6.markdown(f"SL: {pos['sl'] or '-'}")
-                            pc7.markdown(f"TP: {pos['tp'] or '-'}")
-                            pc8.markdown(f"**P&L: ${pos['profit']:.2f}**")
-                            act1, act2, act3 = st.columns(3)
-                            with act1:
-                                st.button(f"❌ Close", key=f"close_{pos['ticket']}", 
-                                          on_click=on_close_position_cb, args=(pm_url, pm_tok, pos["ticket"]))
-                            with act2: n_sl = st.number_input("SL", value=pos.get("sl") or 0.0, step=0.01, key=f"sl_{pos['ticket']}", label_visibility="collapsed")
-                            with act3: n_tp = st.number_input("TP", value=pos.get("tp") or 0.0, step=0.01, key=f"tp_{pos['ticket']}", label_visibility="collapsed")
-                            st.button(f"✏️ Update", key=f"mod_{pos['ticket']}", 
-                                      on_click=on_modify_position_cb, args=(pm_url, pm_tok, pos["ticket"], n_sl, n_tp))
-                else: st.info("No open positions. Use the AI Analyst to find setups.")
+        # 🎯 SURGICAL FRAGMENT: Re-runs only the Chart area
+        @st.fragment(run_every=60 if live_active else None)
+        def live_chart_fragment(symbol, timeframe, count, active):
+            m_url = st.session_state.get("mt5_url", "http://localhost:5000")
+            m_tok = st.secrets.get("MT5_API_TOKEN", "impulse_secure_2026")
             
-            position_manager_fragment()
-
-            @st.fragment()
-            def live_ai_analyst_fragment():
-                st.markdown("---")
-                st.subheader("🤖 Live AI Trade Analyst")
-                if "messages_live" not in st.session_state: st.session_state.messages_live = []
+            # Fetch directly inside fragment
+            df_l = pull_mt5_latest(m_url, symbol, timeframe, count, m_tok)
+            if not df_l.empty:
+                st.session_state.df_live = df_l
                 
-                # --- TRANSACTION STATUS (V2.7) ---
-                if st.session_state.last_exec_msg:
-                    st.info(st.session_state.last_exec_msg)
-                    if st.button("Clear Status"): 
-                        st.session_state.last_exec_msg = ""
-                        st.rerun()
-
-                # Render messages with unique IDs based on index
-                for i, m in enumerate(st.session_state.messages_live):
-                    with st.chat_message(m["role"]):
-                        st.markdown(m["content"])
-                        if m.get("detected_setup"): 
-                            render_trade_card(m["detected_setup"], m_url, m_tok, card_id=f"msg_{i}")
-                        if m.get("detected_action"): 
-                            render_action_card(m["detected_action"], m_url, m_tok)
+                # Pulse Bar UI
+                st.subheader(f"📊 {symbol} — {timeframe} Real-Time Feed")
+                last_bar = df_l.iloc[-1]
+                t_str = last_bar['time'].strftime('%H:%M:%S') if hasattr(last_bar['time'], 'strftime') else str(last_bar['time'])
                 
-                if chat_l := st.chat_input("Analyze live price action...", key="live_chat"):
-                    snapshot_df = st.session_state.df_live.copy()
-                    trade_context = build_trade_context(m_url, m_tok)
-                    enhanced_prompt = f"{trade_context}\n\n{chat_l}" if trade_context else chat_l
-                    process_ai_query(enhanced_prompt, snapshot_df, model_choice, api_key_to_use, provider_choice, history_key="messages_live", base_url=base_url, snapshot=snapshot_df)
+                m1, m2, m3, m4, m5 = st.columns(5)
+                m1.metric("⏲️ Terminal Time", t_str)
+                m2.metric("🟢 OPEN", f"{last_bar['open']:.5f}")
+                m3.metric("📈 HIGH", f"{last_bar['high']:.5f}", delta=f"{(last_bar['high']-last_bar['open']):.5f}")
+                m4.metric("📉 LOW",  f"{last_bar['low']:.5f}",  delta=f"{(last_bar['low']-last_bar['open']):.5f}")
+                m5.metric("🎯 CURRENT", f"{last_bar['close']:.5f}", delta=f"{(last_bar['close']-last_bar['open']):.5f}")
+
+                # Plotly Chart
+                fig = go.Figure(data=[go.Candlestick(x=df_l['time'], open=df_l['open'], high=df_l['high'], low=df_l['low'], close=df_l['close'])])
+                fig.update_layout(template="plotly_dark", height=500, margin=dict(l=10,r=10,t=10,b=10), showlegend=False)
+                st.plotly_chart(fig, use_container_width=True)
+
+        # Trigger Fragment
+        live_chart_fragment(l_sym, l_tf, l_count, live_active)
+
+        # 🤖 LIVE AI ANALYSIS (Independent Area)
+        if st.session_state.get("df_live") is not None:
+            st.markdown("---")
+            st.subheader("🤖 Live AI Trade Analyst")
             
-            live_ai_analyst_fragment()
-
-        with t_perf:
-            @st.fragment(run_every=10) # 10 SECONDS
-            def live_performance_fragment():
-                p_url = st.session_state.get("mt5_url", "http://localhost:5000")
-                p_tok = st.secrets.get("MT5_API_TOKEN", "impulse_secure_2026")
-                render_performance_tab(p_url, p_tok)
+            if "messages_live" not in st.session_state: st.session_state.messages_live = []
             
-            live_performance_fragment()
+            # Historical chat display
+            for m in st.session_state.messages_live:
+                with st.chat_message(m["role"]):
+                    st.markdown(m["content"])
+                    if "code" in m:
+                        # 🛡️ VAULT LOOKUP: Retrieve the frozen snapshot using the ID
+                        snap_id = m.get("snapshot_id")
+                        msg_df = st.session_state.get("data_vault", {}).get(snap_id, st.session_state.df_live)
+                        execute_generated_code(m["code"], msg_df)
 
-        with t_intel:
-            st.subheader("🌐 Global Web Intel")
-            s_query = st.text_input("Topic", placeholder="e.g. Fed news", key="intel_search_tab")
-            if st.button("🔍 Run Deep Intel", key="intel_btn"):
-                if s_query:
-                    from web_search import get_market_news, analyze_sentiment
-                    with st.spinner("Searching..."):
-                        news = get_market_news(s_query, max_results=5)
-                        sent = analyze_sentiment(news) if news else "Unknown"
-                        st.info(f"🧠 AI Sentiment: {sent}")
-                        for n in news:
-                            with st.expander(n['title']):
-                                st.write(n['body'])
-                                st.link_button("Read Source", n['href'])
-
+            if chat_l := st.chat_input("Analyze live price action...", key="live_chat"):
+                # 🛠️ SNAPSHOT MECHANISM: Freeze the data context for this query
+                snapshot_df = st.session_state.df_live.copy()
+                process_ai_query(chat_l, snapshot_df, model_choice, api_key_to_use, provider_choice, 
+                                  history_key="messages_live", base_url=base_url, snapshot=snapshot_df)
     else:
         st.info("📡 Broker Terminal Locked. Please establish the bridge above to stream live market data.")
+
 else:
     st.info("👋 Welcome! Please select a Mode above to begin.")
     st.image("https://developer.nvidia.com/sites/default/files/akamai/NVIDIA_NIM_Icon.png", width=100)
