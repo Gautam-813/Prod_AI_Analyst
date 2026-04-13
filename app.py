@@ -46,6 +46,24 @@ if 'executing' not in st.session_state:
     st.session_state.executing = False
 if 'last_exec_msg' not in st.session_state:
     st.session_state.last_exec_msg = ""
+if 'autopilot_enabled' not in st.session_state:
+    st.session_state.autopilot_enabled = False
+if 'autopilot_lot' not in st.session_state:
+    st.session_state.autopilot_lot = 0.10
+if 'autopilot_logs' not in st.session_state:
+    st.session_state.autopilot_logs = []
+if 'last_auto_run' not in st.session_state:
+    st.session_state.last_auto_run = None
+if 'next_auto_run_time' not in st.session_state:
+    st.session_state.next_auto_run_time = None
+if 'autopilot_thread' not in st.session_state:
+    st.session_state.autopilot_thread = None
+if 'autopilot_interval' not in st.session_state:
+    st.session_state.autopilot_interval = 300  # 5 minutes in seconds
+if 'autopilot_error_count' not in st.session_state:
+    st.session_state.autopilot_error_count = 0
+if 'autopilot_success_count' not in st.session_state:
+    st.session_state.autopilot_success_count = 0
 
 # --- HIGH-SPEED CACHING ---
 @st.cache_data(ttl=3600)
@@ -114,6 +132,38 @@ def calculate_lot_size_risk(account_balance, risk_percent, entry_price, sl_price
         return None
     lot = risk_amount / (sl_distance_points * tick_value)
     return round(max(lot, 0.01), 2)
+
+# ============================================================================
+# 📊 GOOGLE SHEETS MASTER AUDIT LOG SYSTEM
+# ============================================================================
+def master_audit_log(action_type, details):
+    """Unified logger to record actions to Google Sheets via Apps Script Webhook."""
+    try:
+        # Use provided Apps Script URL
+        url = "https://script.google.com/macros/s/AKfycbxtd5reNGnPATB7oCWRtwYYO_BKMb55HwdemU5nw5MwkguSIlL8uV1maT8BkcK0TElz6A/exec"
+        
+        # Priority: Check if URL is in secrets (for production), otherwise use hardcoded
+        webhook_url = st.secrets.get("GSHEETS_LOG_URL", url)
+
+        # Capture source info
+        try:
+            source_info = str(st.context.headers.get("User-Agent", "Unknown Device"))
+        except:
+            source_info = "Unknown"
+
+        data = {
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "username": st.session_state.get("username", "System"),
+            "name": st.session_state.get("user_name", "N/A"),
+            "action": action_type,
+            "details": details,
+            "source": source_info
+        }
+
+        # Send to Google Sheets (Async-like feel with short timeout)
+        requests.post(webhook_url, json=data, timeout=5)
+    except Exception:
+        pass
 
 def _repair_json(text):
     """Fix common AI JSON mistakes: missing commas, trailing commas, unquoted values."""
@@ -217,8 +267,12 @@ def on_execute_market_cb(m_url, m_tok, symbol, action, lot, sl, tp):
         sl_val = sl if sl > 0 else None
         tp_val = tp if tp > 0 else None
         result = place_mt5_order(m_url, m_tok, symbol, action, lot, sl=sl_val, tp=tp_val)
-        st.session_state.last_exec_msg = f"✅ Market {action} #{result.get('ticket')} Successful!"
-        st.toast(st.session_state.last_exec_msg)
+        msg = f"✅ Market {action} #{result.get('ticket')} Successful!"
+        st.session_state.last_exec_msg = msg
+        st.toast(msg)
+        
+        # LOG TO AUDIT
+        master_audit_log("TRADE_EXECUTION", f"Market {action} {lot} {symbol} SL:{sl} TP:{tp} Ticket:{result.get('ticket')}")
     except Exception as e:
         st.session_state.last_exec_msg = f"❌ Market Order Failed: {e}"
         st.toast(st.session_state.last_exec_msg)
@@ -365,6 +419,9 @@ def process_ai_query(prompt, df, model_choice, api_key, model_provider, history_
     history = st.session_state[history_key]
     history.append({"role": "user", "content": prompt})
     
+    # LOG PROMPT TO AUDIT
+    master_audit_log("AI_QUERY", f"Prompt: {prompt}")
+    
     with st.chat_message("user"): st.markdown(prompt)
     
     with st.chat_message("assistant"):
@@ -462,6 +519,192 @@ def process_ai_query(prompt, df, model_choice, api_key, model_provider, history_
             except Exception as e:
                 st.error(f"API Error: {e}")
 
+def handle_autopilot_execution(mt5_url, mt5_token, hf_repo, hf_token, model_choice, api_key, model_provider, base_url, is_background=False):
+    """Orchestrates one cycle of the random prompt autopilot with DETAILED logging."""
+    import random
+    import time
+    import traceback
+
+    timestamp = time.strftime('%H:%M:%S')
+
+    try:
+        # 1. Load Prompts
+        try:
+            with open("test_prompt.txt", "r", encoding="utf-8") as f:
+                prompts = [line.strip() for line in f.readlines() if line.strip() and "." in line]
+        except Exception as e:
+            error_msg = f"🔴 [{timestamp}] File Error: {e}"
+            st.session_state.autopilot_logs.insert(0, error_msg)
+            st.session_state.autopilot_error_count += 1
+            return
+
+        if not prompts:
+            error_msg = f"🔴 [{timestamp}] No prompts found in test_prompt.txt"
+            st.session_state.autopilot_logs.insert(0, error_msg)
+            st.session_state.autopilot_error_count += 1
+            return
+
+        selected_line = random.choice(prompts)
+        prompt_num = selected_line.split(".")[0].strip()
+        prompt_text = selected_line.split(".", 1)[1].strip()
+
+        # 2. Get Data Snapshot (FORCE FRESH DATA)
+        current_sym = st.session_state.get("current_symbol_view", "XAUUSD")
+
+        # We pull the absolute latest 1000 candles directly from MT5 memory
+        try:
+            from data_sync import pull_mt5_latest
+            df = pull_mt5_latest(mt5_url, current_sym, "1m", count=1000, mt5_token=mt5_token)
+        except Exception as e:
+            error_msg = f"🔴 [{timestamp}] P:{prompt_num} Data Fetch Error: {e}"
+            st.session_state.autopilot_logs.insert(0, error_msg)
+            st.session_state.autopilot_error_count += 1
+            return
+
+        if df.empty:
+            st.session_state.autopilot_logs.insert(0, f"🔴 [{timestamp}] P:{prompt_num} Failed: Could not fetch fresh market data.")
+            st.session_state.autopilot_error_count += 1
+            return
+
+        # 3. Request AI Setup (DETAILED LOGGING)
+        st.session_state.autopilot_logs.insert(0, f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        st.session_state.autopilot_logs.insert(0, f"📝 [{timestamp}] Prompt #{prompt_num}: {prompt_text}")
+        st.session_state.autopilot_logs.insert(0, f"📊 Analyzing {current_sym} | {len(df)} candles | TF: 1m")
+
+        df_info = io.StringIO()
+        df.info(buf=df_info)
+        metadata = df_info.getvalue()
+
+        system_prompt = f"""
+        You are a Lead Quant in 2026. USE JSON ONLY FOR TRADES.
+        SCHEMA: {metadata}
+        SAMPLES (Last 5 Rows): {df.tail(5).to_string()}
+        RULES: 1. Output a JSON TRADE_SETUP block.
+        2. Suggest an ENTRY_PRICE based on your analysis of 'df'.
+        """
+
+        # --- 🛡️ ENGINE SAFETY: Resolve API Key ---
+        final_key = api_key
+        if model_provider == "NVIDIA" and not str(final_key).startswith("nvapi-"):
+            final_key = f"nvapi-{final_key}"
+
+        client = OpenAI(base_url=base_url, api_key=final_key)
+
+        try:
+            # Non-streaming for automation
+            ai_start_time = time.time()
+            resp = client.chat.completions.create(
+                model=model_choice,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": f"Analyze current data and {prompt_text}"}
+                ],
+                temperature=0.2,
+                timeout=30  # Add timeout
+            )
+            ai_response_time = time.time() - ai_start_time
+            ai_txt = resp.choices[0].message.content
+            
+            # Log AI response summary (first 200 chars)
+            ai_summary = ai_txt[:200].replace('\n', ' ')
+            st.session_state.autopilot_logs.insert(0, f"🤖 AI Response ({ai_response_time:.1f}s): {ai_summary}...")
+            
+            setup = detect_trade_setup(ai_txt)
+
+            if not setup:
+                st.session_state.autopilot_logs.insert(0, f"🟡 [{timestamp}] P:{prompt_num} Result: No trade setup identified by AI")
+                st.session_state.autopilot_logs.insert(0, f"💡 Market conditions didn't match prompt criteria")
+                return
+
+            # 4. Trade Setup Found - Log Details
+            symbol = setup.get("symbol", current_sym)
+            direction = setup.get("direction", "BUY").upper()
+            entry = setup.get("entry_price", 0)
+            sl = setup.get("stop_loss", 0)
+            tp = setup.get("take_profit", 0)
+            reasoning = setup.get("reasoning", "No reasoning provided")
+
+            st.session_state.autopilot_logs.insert(0, f"🎯 [{timestamp}] P:{prompt_num} TRADE SETUP IDENTIFIED!")
+            st.session_state.autopilot_logs.insert(0, f"   Direction: {'🟢 BUY' if direction == 'BUY' else '🔴 SELL'}")
+            st.session_state.autopilot_logs.insert(0, f"   Symbol: {symbol}")
+            st.session_state.autopilot_logs.insert(0, f"   Entry: {entry} | SL: {sl} | TP: {tp}")
+            st.session_state.autopilot_logs.insert(0, f"   Reasoning: {reasoning}")
+
+            # --- 🛡️ ENGINE SAFETY: Numeric Validation ---
+            try:
+                entry = float(setup.get("entry_price", 0))
+                sl = float(setup.get("stop_loss", 0)) if setup.get("stop_loss") else None
+                tp = float(setup.get("take_profit", 0)) if setup.get("take_profit") else None
+            except (ValueError, TypeError):
+                 st.session_state.autopilot_logs.insert(0, f"🔴 [{timestamp}] P:{prompt_num} Error: AI provided invalid price numbers.")
+                 st.session_state.autopilot_error_count += 1
+                 return
+
+            lot = st.session_state.autopilot_lot
+
+            # Get Live Tick for classification
+            try:
+                headers = {"X-MT5-Token": mt5_token}
+                tick_resp = requests.get(f"{mt5_url.rstrip('/')}/symbol/info/{symbol}", headers=headers, timeout=5)
+                tick_resp.raise_for_status()
+                tick = tick_resp.json()
+                ask, bid = tick.get("ask"), tick.get("bid")
+            except Exception as e:
+                st.session_state.autopilot_logs.insert(0, f"🔴 [{timestamp}] P:{prompt_num} Tick Data Error: {e}")
+                st.session_state.autopilot_error_count += 1
+                return
+
+            if not (entry and ask and bid):
+                st.session_state.autopilot_logs.insert(0, f"🔴 [{timestamp}] P:{prompt_num} Sync Error: Prices missing.")
+                st.session_state.autopilot_error_count += 1
+                return
+
+            # Classification
+            smart_action = ""
+            if direction == "BUY":
+                smart_action = "BUY_LIMIT" if entry < ask else "BUY_STOP"
+            else:
+                smart_action = "SELL_LIMIT" if entry > bid else "SELL_STOP"
+
+            st.session_state.autopilot_logs.insert(0, f"📋 Order Type: {smart_action} (Entry {('below' if 'LIMIT' in smart_action else 'above')} current market)")
+
+            # Place Order
+            try:
+                comment = f"[AUTO][P:{prompt_num}]"
+                order_start_time = time.time()
+                res = place_mt5_order(mt5_url, mt5_token, symbol, smart_action, lot,
+                                      sl=sl, tp=tp, price=entry, comment=comment)
+                order_time = time.time() - order_start_time
+
+                ticket = res.get('ticket', 'N/A')
+                st.session_state.autopilot_logs.insert(0, f"✅✅✅ [{timestamp}] TRADE EXECUTED SUCCESSFULLY! ✅✅✅")
+                st.session_state.autopilot_logs.insert(0, f"   Ticket: #{ticket}")
+                st.session_state.autopilot_logs.insert(0, f"   Type: {smart_action}")
+                st.session_state.autopilot_logs.insert(0, f"   Entry: {entry} | SL: {sl} | TP: {tp}")
+                st.session_state.autopilot_logs.insert(0, f"   Lot: {lot} | Symbol: {symbol}")
+                st.session_state.autopilot_logs.insert(0, f"   Execution Time: {order_time:.2f}s")
+                st.session_state.autopilot_success_count += 1
+                st.session_state.autopilot_logs.insert(0, f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+            except Exception as e:
+                st.session_state.autopilot_logs.insert(0, f"🔴 [{timestamp}] P:{prompt_num} Trade Execution Error: {e}")
+                st.session_state.autopilot_logs.insert(0, f"📝 Order was NOT placed - check MT5 connection")
+                st.session_state.autopilot_error_count += 1
+                st.session_state.autopilot_logs.insert(0, f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+
+        except Exception as e:
+            st.session_state.autopilot_logs.insert(0, f"🔴 [{timestamp}] P:{prompt_num} AI API Error: {e}")
+            st.session_state.autopilot_logs.insert(0, f"📝 AI response was NOT received")
+            st.session_state.autopilot_error_count += 1
+            st.session_state.autopilot_logs.insert(0, f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+            
+    except Exception as e:
+        timestamp = time.strftime('%H:%M:%S')
+        st.session_state.autopilot_logs.insert(0, f"🔴 [{timestamp}] Critical Autopilot Error: {e}")
+        st.session_state.autopilot_logs.insert(0, f"📝 Traceback: {traceback.format_exc()}")
+        st.session_state.autopilot_error_count += 1
+        st.session_state.autopilot_logs.insert(0, f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+
+
 # Lazy/Optional Heavy Imports
 try:
     import pygwalker as pyg
@@ -474,6 +717,73 @@ try:
     AGGRID_AVAILABLE = True
 except (ImportError, MemoryError):
     AGGRID_AVAILABLE = False
+
+# ============================================================================
+# 🧵 BACKGROUND THREAD AUTOPILOT SYSTEM
+# ============================================================================
+import threading
+import time as time_module
+
+def _autopilot_thread_loop(mt5_url, mt5_token, hf_repo, hf_token, model_choice, api_key, model_provider, base_url):
+    """Background thread that runs the autopilot independently of browser refresh."""
+    while st.session_state.get('autopilot_enabled', False):
+        try:
+            # Calculate next run time
+            next_run = time_module.time() + st.session_state.get('autopilot_interval', 300)
+            st.session_state.next_auto_run_time = next_run
+            
+            # Sleep until next execution
+            while st.session_state.get('autopilot_enabled', False) and time_module.time() < next_run:
+                time_module.sleep(1)
+            
+            # Check if still enabled after sleep
+            if not st.session_state.get('autopilot_enabled', False):
+                break
+            
+            # Execute autopilot cycle
+            handle_autopilot_execution(
+                mt5_url, mt5_token, hf_repo, hf_token,
+                model_choice, api_key, model_provider, base_url,
+                is_background=True
+            )
+            
+            # Update last run time
+            st.session_state.last_auto_run = time_module.localtime()
+            
+        except Exception as e:
+            timestamp = time_module.strftime('%H:%M:%S')
+            st.session_state.autopilot_logs.insert(0, f"🔴 [{timestamp}] Thread Error: {e}")
+            time_module.sleep(5)  # Brief pause on error
+    
+    st.session_state.autopilot_thread = None
+
+def start_autopilot_thread(mt5_url, mt5_token, hf_repo, hf_token, model_choice, api_key, model_provider, base_url):
+    """Start the background autopilot thread."""
+    if st.session_state.get('autopilot_thread') is not None:
+        st.session_state.autopilot_logs.insert(0, f"🟡 [{time_module.strftime('%H:%M:%S')}] Autopilot already running")
+        return
+    
+    st.session_state.autopilot_enabled = True
+    st.session_state.next_auto_run_time = time_module.time() + st.session_state.get('autopilot_interval', 300)
+    
+    thread = threading.Thread(
+        target=_autopilot_thread_loop,
+        args=(mt5_url, mt5_token, hf_repo, hf_token, model_choice, api_key, model_provider, base_url),
+        daemon=True
+    )
+    thread.start()
+    st.session_state.autopilot_thread = thread
+    
+    st.session_state.autopilot_logs.insert(0, f"🟢 [{time_module.strftime('%H:%M:%S')}] 🚀 Autopilot background thread started")
+
+def stop_autopilot_thread():
+    """Stop the background autopilot thread."""
+    st.session_state.autopilot_enabled = False
+    st.session_state.next_auto_run_time = None
+    
+    if st.session_state.get('autopilot_thread') is not None:
+        st.session_state.autopilot_logs.insert(0, f"🔴 [{time_module.strftime('%H:%M:%S')}] ⏹️ Autopilot background thread stopped")
+        st.session_state.autopilot_thread = None
 
 # Symbol Mapping (MT5 -> Yahoo Finance)
 YAHOO_MAPPING = {
@@ -515,21 +825,44 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # Password Protection
+# Password Protection & Multi-User Auth
 def check_password():
-    """Check if the user has entered the correct password."""
+    """Check if the user has entered a valid username and password."""
     if "authenticated" not in st.session_state:
         st.session_state.authenticated = False
     
+    def log_access(username):
+        """Log successful login attempt with source information."""
+        master_audit_log("LOGIN", "Successfully logged into station")
+
     def login():
+        entered_username = st.session_state.username_input
         entered_password = st.session_state.password_input
-        if entered_password == st.secrets.get("PASSWORD", ""):
+        
+        try:
+            with open("users.json", "r") as f:
+                user_db = json.load(f)
+                users = user_db.get("users", [])
+        except Exception as e:
+            st.error(f"Error loading user database: {e}")
+            return
+            
+        # Validate credentials
+        found_user = next((u for u in users if u["username"] == entered_username and u["password"] == entered_password), None)
+        
+        if found_user:
             st.session_state.authenticated = True
+            st.session_state.user_name = found_user.get("name", entered_username)
+            st.session_state.username = entered_username
+            log_access(entered_username)
+            st.toast(f"Welcome back, {st.session_state.user_name}!")
         else:
             st.session_state.login_error = True
     
     def logout():
         st.session_state.authenticated = False
         st.session_state.login_error = False
+        st.session_state.username_input = ""
         st.session_state.password_input = ""
         st.rerun()
     
@@ -538,16 +871,18 @@ def check_password():
         <style>
         .login-container {
             max-width: 400px;
-            margin: 100px auto;
+            margin: 80px auto;
             padding: 40px;
-            border-radius: 10px;
+            border-radius: 12px;
             background: #161b22;
             border: 1px solid #30363d;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.5);
         }
         .login-title {
             text-align: center;
-            color: #ccd6f6;
+            color: #58a6ff;
             margin-bottom: 30px;
+            font-family: 'Inter', sans-serif;
         }
         </style>
         """, unsafe_allow_html=True)
@@ -555,22 +890,36 @@ def check_password():
         col1, col2, col3 = st.columns([1, 1, 1])
         with col2:
             st.markdown('<div class="login-container">', unsafe_allow_html=True)
-            st.markdown('<h2 class="login-title">🔐 Login Required</h2>', unsafe_allow_html=True)
+            st.markdown('<h2 class="login-title">🏛️ Quant Station Login</h2>', unsafe_allow_html=True)
+            
+            st.text_input(
+                "Username",
+                key="username_input",
+                placeholder="Enter username"
+            )
+            
             st.text_input(
                 "Password",
                 type="password",
                 key="password_input",
-                on_change=login,
-                placeholder="Enter access password"
+                placeholder="Enter password"
             )
+            
+            if st.button("🚀 Enter Station", width="stretch", on_click=login):
+                pass
+
             if st.session_state.get("login_error", False):
-                st.error("❌ Incorrect password. Please try again.")
+                st.error("❌ Invalid Username or Password")
             st.markdown('</div>', unsafe_allow_html=True)
         return False
     
-    # Show logout button and EA download for authenticated users
+    # Sidebar Logout & User Info
     with st.sidebar:
+        st.markdown(f"#### 👤 User: {st.session_state.get('user_name', 'Unknown')}")
+        if st.button("🚪 Logout Session", width="stretch"):
+            logout()
         st.markdown("---")
+        
         # EA Files Download
         st.subheader("📦 Download EA Files")
         st.caption("Download the MA Impulse Logger EA for generating datasets")
@@ -578,21 +927,15 @@ def check_password():
         import zipfile
         import os
         
-        if st.button("📥 Download EA Package (ZIP)", width="stretch"):
-            # Create ZIP file in memory
+        if st.button("📥 Download EA Package (ZIP)", key="ea_zip_btn"):
             zip_buffer = io.BytesIO()
             base_dir = os.path.dirname(os.path.abspath(__file__))
             
             with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
-                # Add .ex5 file
-                ex5_path = os.path.join(base_dir, "MA_Impulse_Logger.ex5")
-                if os.path.exists(ex5_path):
-                    zip_file.write(ex5_path, "MA_Impulse_Logger.ex5")
-                
-                # Add .mq5 file
-                mq5_path = os.path.join(base_dir, "MA_Impulse_Logger.mq5")
-                if os.path.exists(mq5_path):
-                    zip_file.write(mq5_path, "MA_Impulse_Logger.mq5")
+                for file_name in ["MA_Impulse_Logger.ex5", "MA_Impulse_Logger.mq5"]:
+                    path = os.path.join(base_dir, file_name)
+                    if os.path.exists(path):
+                        zip_file.write(path, file_name)
             
             zip_buffer.seek(0)
             st.download_button(
@@ -602,10 +945,7 @@ def check_password():
                 mime="application/zip",
                 key="download_ea_zip"
             )
-        
         st.markdown("---")
-        if st.button("🚪 Logout", width="stretch"):
-            logout()
     
     return True
 
@@ -746,20 +1086,100 @@ with st.sidebar:
     )
     st.session_state.data_source_priority = data_source_priority
 
-    # Simple freshness display (Optional but nice for sidebar)
     # --- ⚡ AUTO-SYNC & CREDENTIALS ---
+    # These MUST be defined before autopilot control center
     hf_repo  = st.secrets.get("HF_REPO_ID", "")
     hf_token = st.secrets.get("HuggingFace_API_KEY", "")
     mt5_url = st.session_state.get("mt5_url", "http://localhost:5000")
     mt5_token = st.secrets.get("MT5_API_TOKEN", "impulse_secure_2026")
 
+    # 🚀 --- AUTOPILOT CONTROL CENTER ---
+    st.markdown("---")
+    st.subheader("🚀 PROMPT AUTOPILOT (THREAD-BASED)")
+    st.caption("Background thread runs every 5 min - independent of browser refresh!")
+
+    # Autopilot interval control
+    interval_minutes = st.session_state.get('autopilot_interval', 300) / 60
+    new_interval = st.selectbox(
+        "⏱️ Execution Interval",
+        options=[1, 2, 3, 5, 10, 15, 20, 30],
+        index=[1, 2, 3, 4, 5, 6, 7, 8].index(5) if 5 in [1, 2, 3, 5, 10, 15, 20, 30] else 3,
+        format_func=lambda x: f"Every {x} minute{'s' if x > 1 else ''}",
+        help="How often the autopilot should run"
+    )
+    st.session_state.autopilot_interval = new_interval * 60
+
+    # Start/Stop buttons
+    col_start, col_stop = st.columns(2)
+    
+    with col_start:
+        if st.button("🚀 Start Autopilot", type="primary", use_container_width=True,
+                    disabled=st.session_state.get('autopilot_thread') is not None):
+            start_autopilot_thread(
+                mt5_url, mt5_token, hf_repo, hf_token,
+                model_choice, api_key_to_use, provider_choice, base_url
+            )
+            st.rerun()
+    
+    with col_stop:
+        if st.button("⏹️ Stop Autopilot", type="secondary", use_container_width=True,
+                    disabled=st.session_state.get('autopilot_thread') is None):
+            stop_autopilot_thread()
+            st.rerun()
+
+    # Status display
+    if st.session_state.get('autopilot_thread') is not None:
+        st.success("✅ Background thread is running")
+        
+        # Countdown timer
+        next_run = st.session_state.get('next_auto_run_time')
+        if next_run:
+            import time as time_module
+            remaining = max(0, next_run - time_module.time())
+            minutes = int(remaining // 60)
+            seconds = int(remaining % 60)
+            st.info(f"⏰ Next execution in: **{minutes}m {seconds}s**")
+        
+        if st.session_state.last_auto_run:
+            import time as time_module
+            st.caption(f"Last Run: {time_module.strftime('%H:%M:%S', st.session_state.last_auto_run)}")
+    else:
+        st.warning("⏹️ Autopilot is stopped")
+
+    # Lot size control
+    st.session_state.autopilot_lot = st.number_input(
+        "Auto-Pilot Fixed Lot",
+        value=st.session_state.autopilot_lot,
+        min_value=0.01, 
+        step=0.01
+    )
+
+    # Statistics
+    col_stat1, col_stat2, col_stat3 = st.columns(3)
+    with col_stat1:
+        st.metric("✅ Success", st.session_state.get('autopilot_success_count', 0))
+    with col_stat2:
+        st.metric("❌ Errors", st.session_state.get('autopilot_error_count', 0))
+    with col_stat3:
+        total = st.session_state.get('autopilot_success_count', 0) + st.session_state.get('autopilot_error_count', 0)
+        success = st.session_state.get('autopilot_success_count', 0)
+        rate = (success / total * 100) if total > 0 else 0
+        st.metric("📊 Success Rate", f"{rate:.1f}%")
+
+    if st.button("🧹 Clear Auto-Logs & Stats"):
+        st.session_state.autopilot_logs = []
+        st.session_state.autopilot_error_count = 0
+        st.session_state.autopilot_success_count = 0
+        st.rerun()
+
+    # Simple freshness display (Optional but nice for sidebar)
     st.markdown("---")
     st.subheader("⚡ Auto-Sync Mode")
     auto_sync_on = st.toggle("Enable Auto-Sync 📡", value=st.session_state.get("auto_sync_on", False))
     st.session_state.auto_sync_on = auto_sync_on
 
     if auto_sync_on:
-        sync_interval = st.selectbox("Frequency ⏱️", [1, 5, 15, 30, 60], index=2, format_func=lambda x: f"Every {x} min")
+        sync_interval = st.selectbox("Frequency ⏱️", [1, 4, 5, 10, 15, 30, 60], index=1, format_func=lambda x: f"Every {x} min")
         refresh_count = st_autorefresh(interval=sync_interval * 60 * 1000, key="sync_counter")
         
         if refresh_count > 0:
@@ -772,6 +1192,9 @@ with st.sidebar:
                     st.toast(f"🔄 Auto-Synced {current_sym} ({stats.get('new_rows', 0)} new candles)")
                 except Exception as e:
                     st.toast(f"🚨 Auto-Sync failed for {current_sym}")
+
+    # Note: Autopilot now runs in a background thread (see control center above)
+    # No browser-dependent refresh needed!
 
     # --- 🌍 GLOBAL MARKET VAULT ---
     st.markdown("---")
@@ -1533,3 +1956,47 @@ elif "Live" in view_mode:
 else:
     st.info("👋 Welcome! Please select a Mode above to begin.")
     st.image("https://developer.nvidia.com/sites/default/files/akamai/NVIDIA_NIM_Icon.png", width=100)
+
+# --- 📊 AUTOPILOT DASHBOARD ---
+if st.session_state.get('autopilot_thread') is not None or st.session_state.autopilot_logs:
+    # Auto-refresh UI every 2 seconds when autopilot is running
+    # This is needed so the countdown timer and logs update visibly
+    if st.session_state.get('autopilot_thread') is not None:
+        st_autorefresh(interval=2000, key="autopilot_ui_refresh")
+    
+    st.markdown("---")
+    st.subheader("📊 Automation Log & Activity")
+
+    # Status bar
+    status_col1, status_col2, status_col3 = st.columns(3)
+    with status_col1:
+        if st.session_state.get('autopilot_thread') is not None:
+            st.success("🟢 Thread Active")
+        else:
+            st.info("⏹️ Thread Stopped")
+    with status_col2:
+        next_run = st.session_state.get('next_auto_run_time')
+        if next_run:
+            import time as time_module
+            remaining = max(0, next_run - time_module.time())
+            minutes = int(remaining // 60)
+            seconds = int(remaining % 60)
+            st.info(f"⏰ Next: {minutes}m {seconds}s")
+        else:
+            st.caption("Not scheduled")
+    with status_col3:
+        total_runs = st.session_state.get('autopilot_success_count', 0) + st.session_state.get('autopilot_error_count', 0)
+        st.metric("📝 Total Runs", total_runs)
+
+    # Log container
+    log_container = st.container(height=300)
+    with log_container:
+        if not st.session_state.autopilot_logs:
+            st.info("Waiting for first execution...")
+        else:
+            # Show last 50 logs to prevent overflow
+            display_logs = st.session_state.autopilot_logs[:50]
+            for log in display_logs:
+                st.write(log)
+            if len(st.session_state.autopilot_logs) > 50:
+                st.caption(f"... and {len(st.session_state.autopilot_logs) - 50} more older logs")

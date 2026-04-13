@@ -1,0 +1,26 @@
+Traceback (most recent call last):
+  File "d:\date-wise\06-04-2026\impulse_analyst\impulse_autopilot\backend\data_sync.py", line 18, in <module>
+    import yfinance as yf
+  File "C:\Users\Administrator\AppData\Local\Programs\Python\Python311\Lib\site-packages\yfinance\__init__.py", line 25, in <module>
+    from .ticker import Ticker
+  File "C:\Users\Administrator\AppData\Local\Programs\Python\Python311\Lib\site-packages\yfinance\ticker.py", line 28, in <module>
+    from .base import TickerBase
+  File "C:\Users\Administrator\AppData\Local\Programs\Python\Python311\Lib\site-packages\yfinance\base.py", line 38, in <module>
+    from .live import WebSocket
+  File "C:\Users\Administrator\AppData\Local\Programs\Python\Python311\Lib\site-packages\yfinance\live.py", line 7, in <module>
+    from websockets.asyncio.client import connect as async_connect
+ModuleNotFoundError: No module named 'websockets.asyncio'
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "d:\date-wise\06-04-2026\impulse_analyst\impulse_autopilot\backend\main.py", line 33, in <module>
+    from routes_chat_and_data import router as chat_data_router
+  File "d:\date-wise\06-04-2026\impulse_analyst\impulse_autopilot\backend\routes_chat_and_data.py", line 37, in <module>
+    from data_sync import (
+  File "d:\date-wise\06-04-2026\impulse_analyst\impulse_autopilot\backend\data_sync.py", line 21, in <module>
+    print(f"\u26a0\ufe0f yfinance not available: {e}")
+  File "C:\Users\Administrator\AppData\Local\Programs\Python\Python311\Lib\encodings\cp1252.py", line 19, in encode
+    return codecs.charmap_encode(input,self.errors,encoding_table)[0]
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+UnicodeEncodeError: 'charmap' codec can't encode characters in position 0-1: character maps to <undefined>

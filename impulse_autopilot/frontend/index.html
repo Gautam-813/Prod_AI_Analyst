@@ -1,0 +1,635 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Impulse AI Analyst - Quant Trading Platform</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css">
+    <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
+</head>
+
+<body>
+    <!-- Header -->
+    <header class="header">
+        <div class="header-left">
+            <div class="logo">
+                <i class="fas fa-chart-line"></i>
+                <h1>Impulse AI Analyst</h1>
+            </div>
+            <div class="connection-status" id="connectionStatus">
+                <span class="status-dot"></span>
+                <span class="status-text">Disconnected</span>
+            </div>
+        </div>
+        <div class="header-right">
+            <div class="server-time" id="serverTime">--:--:--</div>
+            <button class="btn btn-sm btn-secondary" id="refreshBtn">
+                <i class="fas fa-sync-alt"></i> Refresh
+            </button>
+        </div>
+    </header>
+
+    <!-- Main Navigation Tabs -->
+    <nav class="main-tabs">
+        <button class="tab-btn active" data-tab="history">
+            <i class="fas fa-database"></i> 📜 History
+        </button>
+        <button class="tab-btn" data-tab="live">
+            <i class="fas fa-broadcast-tower"></i> 📺 Live Terminal
+        </button>
+        <button class="tab-btn" data-tab="autopilot">
+            <i class="fas fa-robot"></i> 🚀 Autopilot
+        </button>
+    </nav>
+
+    <!-- Main Container -->
+    <main class="main-container">
+
+        <!-- ==================== HISTORY MODE ==================== -->
+        <section class="tab-content active" id="historyTab">
+            <div class="two-column-layout">
+                <!-- Left: Data Sources & Preview -->
+                <div class="column">
+                    <!-- Upload Section -->
+                    <section class="card">
+                        <h2 class="card-title"><i class="fas fa-upload"></i> Upload Historical Data</h2>
+                        <div class="upload-zone" id="uploadZone">
+                            <i class="fas fa-cloud-upload-alt fa-3x"></i>
+                            <p>Drag & drop .parquet or .csv file here</p>
+                            <p class="text-muted">or</p>
+                            <input type="file" id="fileInput" accept=".csv,.parquet" style="display: none;">
+                            <button class="btn btn-primary" id="browseBtn">
+                                <i class="fas fa-folder-open"></i> Browse Files
+                            </button>
+                        </div>
+                        <div class="upload-status" id="uploadStatus"></div>
+                        <button class="btn btn-sm btn-danger btn-block mt-1" id="clearWorkspaceBtn">
+                            <i class="fas fa-trash"></i> Clear Workspace
+                        </button>
+                    </section>
+
+                    <!-- Data Source Selector -->
+                    <section class="card">
+                        <h2 class="card-title"><i class="fas fa-cloud"></i> Data Strategy</h2>
+                        <div class="form-group">
+                            <label for="dataSourceSelect">Default Data Source</label>
+                            <select id="dataSourceSelect">
+                                <option value="local">💾 Local Disk (.parquet/.csv)</option>
+                                <option value="huggingface">☁️ Cloud Hub (Hugging Face)</option>
+                                <option value="yahoo">📈 Yahoo Finance</option>
+                                <option value="mt5">🔌 MT5 Server</option>
+                            </select>
+                        </div>
+                        <div class="data-source-buttons" id="dataSourceButtons">
+                            <button class="btn btn-secondary btn-block" id="fetchHFBtn">
+                                <i class="fas fa-cloud-download-alt"></i> Fetch from HuggingFace
+                            </button>
+                            <button class="btn btn-secondary btn-block" id="fetchYahooBtn">
+                                <i class="fas fa-chart-line"></i> Fetch from Yahoo Finance
+                            </button>
+                            <button class="btn btn-secondary btn-block" id="fetchMT5Btn">
+                                <i class="fas fa-plug"></i> Fetch from MT5
+                            </button>
+                        </div>
+                    </section>
+
+                    <!-- Yahoo Finance Vault -->
+                    <section class="card">
+                        <h2 class="card-title"><i class="fas fa-globe"></i> Global Market Vault</h2>
+                        <div class="form-group">
+                            <label for="yahooSymbol">Ticker Symbol</label>
+                            <input type="text" id="yahooSymbol" placeholder="e.g. GC=F, EURUSD=X, NVDA, TSLA">
+                        </div>
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label for="yahooPeriod">Period</label>
+                                <select id="yahooPeriod">
+                                    <option value="1mo">1 Month</option>
+                                    <option value="3mo">3 Months</option>
+                                    <option value="1y" selected>1 Year</option>
+                                    <option value="5y">5 Years</option>
+                                    <option value="max">Max</option>
+                                </select>
+                            </div>
+                            <div class="form-group">
+                                <label for="yahooInterval">Interval</label>
+                                <select id="yahooInterval">
+                                    <option value="1h">1 Hour</option>
+                                    <option value="1d" selected>1 Day</option>
+                                    <option value="1wk">1 Week</option>
+                                </select>
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <div class="toggle-container">
+                                <input type="checkbox" id="yahooArchiveToggle">
+                                <label for="yahooArchiveToggle">Archive to HuggingFace</label>
+                            </div>
+                        </div>
+                        <button class="btn btn-success btn-block" id="fetchYahooVaultBtn">
+                            <i class="fas fa-download"></i> Fetch & Archive to Cloud
+                        </button>
+                        <div class="upload-status" id="yahooStatus"></div>
+                    </section>
+
+                    <!-- Auto-Sync Mode -->
+                    <section class="card">
+                        <h2 class="card-title"><i class="fas fa-sync-alt"></i> Auto-Sync Mode</h2>
+                        <div class="form-group">
+                            <div class="toggle-container">
+                                <input type="checkbox" id="autoSyncToggle">
+                                <label for="autoSyncToggle">Enable Auto-Sync 📡</label>
+                            </div>
+                        </div>
+                        <div class="form-group" id="autoSyncOptions" style="display: none;">
+                            <label for="autoSyncInterval">Frequency</label>
+                            <select id="autoSyncInterval">
+                                <option value="1">Every 1 minute</option>
+                                <option value="4" selected>Every 4 minutes</option>
+                                <option value="5">Every 5 minutes</option>
+                                <option value="10">Every 10 minutes</option>
+                                <option value="15">Every 15 minutes</option>
+                            </select>
+                        </div>
+                        <div class="upload-status" id="autoSyncStatus"></div>
+                    </section>
+
+                    <!-- Data Preview -->
+                    <section class="card" id="dataPreviewCard" style="display: none;">
+                        <h2 class="card-title"><i class="fas fa-table"></i> Data Preview</h2>
+                        <div class="data-info" id="dataInfo"></div>
+                        <div class="table-container">
+                            <table class="data-table" id="previewTable">
+                                <thead id="previewTableHead"></thead>
+                                <tbody id="previewTableBody"></tbody>
+                            </table>
+                        </div>
+                    </section>
+                </div>
+
+                <!-- Right: AI Chat -->
+                <div class="column">
+                    <section class="card chat-card">
+                        <h2 class="card-title"><i class="fas fa-comments"></i> AI Data Analyst (Historical)</h2>
+                        <div class="chat-messages" id="historyChatMessages"></div>
+                        <div class="chat-input-container">
+                            <textarea id="historyChatInput"
+                                placeholder="Ask AI to analyze the data... (e.g., 'Show me the best MA crossover setup')"
+                                rows="2"></textarea>
+                            <button class="btn btn-primary" id="historyChatSend">
+                                <i class="fas fa-paper-plane"></i>
+                            </button>
+                        </div>
+                    </section>
+
+                    <!-- Code Output -->
+                    <section class="card" id="historyCodeOutput" style="display: none;">
+                        <h2 class="card-title"><i class="fas fa-code"></i> AI Code Execution</h2>
+                        <div class="code-block" id="historyCodeBlock"></div>
+                        <div class="code-output" id="historyCodeOutputText"></div>
+                        <div class="plots-container" id="historyPlots"></div>
+                    </section>
+
+                    <!-- Trade Setup Card -->
+                    <section class="card" id="historyTradeSetup" style="display: none;">
+                        <h2 class="card-title"><i class="fas fa-bullseye"></i> Trade Setup Detected</h2>
+                        <div class="trade-setup-info" id="historyTradeSetupInfo"></div>
+                    </section>
+
+                    <!-- Trade Action Card (for position management) -->
+                    <section class="card" id="historyTradeAction" style="display: none;">
+                        <h2 class="card-title"><i class="fas fa-tasks"></i> AI Trade Suggestion</h2>
+                        <div class="trade-action-info" id="historyTradeActionInfo"></div>
+                        <div class="trade-action-buttons" id="historyTradeActionButtons"></div>
+                    </section>
+
+                    <!-- Web Intel Search -->
+                    <section class="card">
+                        <h2 class="card-title"><i class="fas fa-search"></i> Global Web Intel</h2>
+                        <p class="text-muted text-sm">AI-powered research for macro news, sentiment, and geopolitics</p>
+                        <div class="form-group">
+                            <label for="webIntelQuery">Research Topic</label>
+                            <input type="text" id="webIntelQuery" placeholder="e.g. FOMC meeting, XAUUSD sentiment">
+                        </div>
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label for="webIntelMaxResults">Max Results</label>
+                                <select id="webIntelMaxResults">
+                                    <option value="3">3 results</option>
+                                    <option value="5" selected>5 results</option>
+                                    <option value="10">10 results</option>
+                                </select>
+                            </div>
+                            <div class="form-group">
+                                <label for="webIntelType">Focus</label>
+                                <select id="webIntelType">
+                                    <option value="general">General Search</option>
+                                    <option value="news">Market News</option>
+                                </select>
+                            </div>
+                        </div>
+                        <button class="btn btn-secondary btn-block" id="webIntelSearchBtn">
+                            <i class="fas fa-search"></i> Deep Intel Search
+                        </button>
+                        <div class="web-intel-results" id="webIntelResults"></div>
+                    </section>
+                </div>
+            </div>
+        </section>
+
+        <!-- ==================== LIVE MODE ==================== -->
+        <section class="tab-content" id="liveTab">
+            <!-- MT5 Connection Gate -->
+            <section class="card" id="mt5ConnectionGate">
+                <h2 class="card-title"><i class="fas fa-plug"></i> MT5 Broker Connection Gate</h2>
+                <div class="connection-form">
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label for="liveMt5Url">MT5 Server URL</label>
+                            <input type="text" id="liveMt5Url" value="http://localhost:5000"
+                                placeholder="http://localhost:5000">
+                        </div>
+                        <div class="form-group">
+                            <label for="liveMt5Token">Security Token</label>
+                            <input type="password" id="liveMt5Token" value="impulse_secure_2026"
+                                placeholder="Enter MT5 token">
+                        </div>
+                        <div class="form-group form-group-button">
+                            <button class="btn btn-primary btn-block" id="connectMt5Btn">
+                                <i class="fas fa-link"></i> Connect
+                            </button>
+                        </div>
+                    </div>
+                </div>
+                <div class="connection-status-text" id="mt5ConnectionStatus"></div>
+            </section>
+
+            <!-- Live Terminal (Hidden until connected) -->
+            <div id="liveTerminal" style="display: none;">
+                <!-- Chart & Controls -->
+                <section class="card">
+                    <div class="live-controls">
+                        <div class="control-group">
+                            <label for="liveSymbol">Symbol</label>
+                            <select id="liveSymbol">
+                                <option value="XAUUSD">XAUUSD</option>
+                                <option value="EURUSD">EURUSD</option>
+                                <option value="DXY">DXY</option>
+                            </select>
+                        </div>
+                        <div class="control-group">
+                            <label for="liveTimeframe">Timeframe</label>
+                            <select id="liveTimeframe">
+                                <option value="1m">1m</option>
+                                <option value="5m">5m</option>
+                                <option value="15m">15m</option>
+                                <option value="1h">1h</option>
+                            </select>
+                        </div>
+                        <div class="control-group">
+                            <label for="liveCount">Lookback Bars</label>
+                            <input type="number" id="liveCount" value="500" min="100" max="5000" step="100">
+                        </div>
+                        <div class="control-group">
+                            <label>&nbsp;</label>
+                            <button class="btn btn-primary" id="fetchLiveBtn">
+                                <i class="fas fa-sync-alt"></i> Fetch Data
+                            </button>
+                        </div>
+                        <div class="control-group">
+                            <label>&nbsp;</label>
+                            <div class="toggle-container">
+                                <input type="checkbox" id="autoRefreshToggle">
+                                <label for="autoRefreshToggle">Auto-Refresh 📡</label>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Live Chart -->
+                    <div class="chart-container">
+                        <div id="liveChart"></div>
+                    </div>
+
+                    <!-- Market Metrics -->
+                    <div class="market-metrics" id="marketMetrics"></div>
+                </section>
+
+                <div class="two-column-layout">
+                    <!-- Left: AI Chat & Position Manager -->
+                    <div class="column">
+                        <!-- AI Chat Live -->
+                        <section class="card chat-card">
+                            <h2 class="card-title"><i class="fas fa-comments"></i> AI Live Terminal</h2>
+                            <div class="chat-messages" id="liveChatMessages"></div>
+                            <div class="chat-input-container">
+                                <textarea id="liveChatInput" placeholder="Ask AI to analyze live market..."
+                                    rows="2"></textarea>
+                                <button class="btn btn-primary" id="liveChatSend">
+                                    <i class="fas fa-paper-plane"></i>
+                                </button>
+                            </div>
+                        </section>
+
+                        <!-- Position Manager -->
+                        <section class="card" id="positionManager">
+                            <h2 class="card-title"><i class="fas fa-briefcase"></i> Open Positions</h2>
+                            <div id="positionsList"></div>
+                            <button class="btn btn-sm btn-secondary" id="refreshPositionsBtn">
+                                <i class="fas fa-sync-alt"></i> Refresh
+                            </button>
+                        </section>
+                    </div>
+
+                    <!-- Right: Trade Setup & Action Cards -->
+                    <div class="column">
+                        <!-- Trade Setup Card -->
+                        <section class="card" id="liveTradeSetup" style="display: none;">
+                            <h2 class="card-title"><i class="fas fa-bullseye"></i> Trade Setup Detected</h2>
+                            <div class="trade-setup-info" id="liveTradeSetupInfo"></div>
+                            <div class="trade-action-buttons" id="liveTradeActionButtons"></div>
+                        </section>
+
+                        <!-- Trade Action Card -->
+                        <section class="card" id="liveTradeAction" style="display: none;">
+                            <h2 class="card-title"><i class="fas fa-tasks"></i> AI Trade Suggestion</h2>
+                            <div class="trade-action-info" id="liveTradeActionInfo"></div>
+                            <div class="trade-action-buttons" id="liveTradeActionButtons2"></div>
+                        </section>
+
+                        <!-- Code Output -->
+                        <section class="card" id="liveCodeOutput" style="display: none;">
+                            <h2 class="card-title"><i class="fas fa-code"></i> AI Code Execution</h2>
+                            <div class="code-block" id="liveCodeBlock"></div>
+                            <div class="code-output" id="liveCodeOutputText"></div>
+                            <div class="plots-container" id="livePlots"></div>
+                        </section>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- ==================== AUTOPILOT MODE ==================== -->
+        <section class="tab-content" id="autopilotTab">
+            <!-- Status Bar -->
+            <section class="status-bar card">
+                <div class="status-item">
+                    <div class="status-label">Autopilot Status</div>
+                    <div class="status-value" id="autopilotStatus">
+                        <span class="badge badge-inactive">INACTIVE</span>
+                    </div>
+                </div>
+                <div class="status-item">
+                    <div class="status-label">Next Run</div>
+                    <div class="status-value" id="nextRun">--:--:--</div>
+                </div>
+                <div class="status-item">
+                    <div class="status-label">Countdown</div>
+                    <div class="status-value" id="countdown">--:--</div>
+                </div>
+                <div class="status-item">
+                    <div class="status-label">Total Runs</div>
+                    <div class="status-value" id="totalRuns">0</div>
+                </div>
+                <div class="status-item">
+                    <div class="status-label">Interval</div>
+                    <div class="status-value" id="currentInterval">5 min</div>
+                </div>
+            </section>
+
+            <div class="two-column-layout">
+                <!-- Left: Controls & Config -->
+                <div class="column">
+                    <!-- Control Panel -->
+                    <section class="card control-panel">
+                        <h2 class="card-title"><i class="fas fa-sliders-h"></i> Control Panel</h2>
+                        <div class="control-buttons">
+                            <button class="btn btn-primary btn-lg" id="startBtn">
+                                <i class="fas fa-play"></i> Start Autopilot
+                            </button>
+                            <button class="btn btn-danger btn-lg" id="stopBtn" disabled>
+                                <i class="fas fa-stop"></i> Stop Autopilot
+                            </button>
+                        </div>
+                        <div class="control-group">
+                            <label for="intervalSelect">Run Interval (minutes)</label>
+                            <div class="input-group">
+                                <select id="intervalSelect">
+                                    <option value="60">1 minute</option>
+                                    <option value="120">2 minutes</option>
+                                    <option value="180">3 minutes</option>
+                                    <option value="300" selected>5 minutes</option>
+                                    <option value="600">10 minutes</option>
+                                    <option value="900">15 minutes</option>
+                                    <option value="1800">30 minutes</option>
+                                    <option value="3600">1 hour</option>
+                                </select>
+                                <button class="btn btn-sm btn-secondary" id="applyIntervalBtn">
+                                    <i class="fas fa-check"></i> Apply
+                                </button>
+                            </div>
+                        </div>
+                    </section>
+
+                    <!-- AI Provider Configuration -->
+                    <section class="card config-panel">
+                        <h2 class="card-title"><i class="fas fa-robot"></i> AI Provider Configuration</h2>
+                        <div class="config-form">
+                            <div class="form-group">
+                                <label for="providerSelect">AI Provider</label>
+                                <select id="providerSelect">
+                                    <option value="">-- Select Provider --</option>
+                                    <option value="NVIDIA">NVIDIA</option>
+                                    <option value="Groq">Groq</option>
+                                    <option value="OpenRouter">OpenRouter</option>
+                                    <option value="OpenRouter (Free)">OpenRouter (Free)</option>
+                                    <option value="Gemini">Gemini</option>
+                                    <option value="GitHub Models">GitHub Models</option>
+                                    <option value="Cerebras">Cerebras</option>
+                                    <option value="Bytez">Bytez</option>
+                                </select>
+                            </div>
+                            <div class="form-group">
+                                <label for="modelSelect">AI Model</label>
+                                <select id="modelSelect" disabled>
+                                    <option value="">-- Select Provider First --</option>
+                                </select>
+                            </div>
+                            <div class="form-group">
+                                <label for="apiKeyInput">API Key</label>
+                                <div class="input-with-toggle">
+                                    <input type="password" id="apiKeyInput" placeholder="Enter your API key..."
+                                        autocomplete="off">
+                                    <button type="button" class="toggle-visibility" id="toggleApiKey">
+                                        <i class="fas fa-eye"></i>
+                                    </button>
+                                </div>
+                                <button class="btn btn-sm btn-secondary btn-block" id="useDefaultKeyBtn"
+                                    style="margin-top: 0.5rem;">
+                                    <i class="fas fa-key"></i> Use Default Key (from server)
+                                </button>
+                            </div>
+                            <div class="form-group">
+                                <label for="mt5UrlInput">MT5 Server URL</label>
+                                <input type="text" id="mt5UrlInput" placeholder="http://localhost:5000">
+                            </div>
+                            <div class="form-group">
+                                <label for="mt5TokenInput">MT5 Token</label>
+                                <div class="input-with-toggle">
+                                    <input type="password" id="mt5TokenInput" placeholder="Enter MT5 token..."
+                                        autocomplete="off">
+                                    <button type="button" class="toggle-visibility" id="toggleMt5Token">
+                                        <i class="fas fa-eye"></i>
+                                    </button>
+                                </div>
+                            </div>
+
+                            <!-- AI Options -->
+                            <div class="form-group">
+                                <div class="toggle-container">
+                                    <input type="checkbox" id="enableThinking" checked>
+                                    <label for="enableThinking">Enable Thinking Mode</label>
+                                </div>
+                            </div>
+                            <div class="form-group">
+                                <div class="toggle-container">
+                                    <input type="checkbox" id="showDebugTrace">
+                                    <label for="showDebugTrace">Show AI Trace (Debug)</label>
+                                </div>
+                            </div>
+
+                            <!-- Action Buttons -->
+                            <div class="config-actions">
+                                <button class="btn btn-secondary btn-block" id="testConnectionBtn">
+                                    <i class="fas fa-plug-circle-check"></i> Test AI Connection
+                                </button>
+                                <button class="btn btn-secondary btn-block" id="clearMemoryBtn">
+                                    <i class="fas fa-broom"></i> Clear AI Memory
+                                </button>
+                                <button class="btn btn-secondary btn-block" id="downloadEABtn">
+                                    <i class="fas fa-download"></i> Download EA Files
+                                </button>
+                            </div>
+
+                            <button class="btn btn-success btn-block" id="saveConfigBtn">
+                                <i class="fas fa-save"></i> Save Configuration
+                            </button>
+                            <div class="config-status" id="configStatus"></div>
+                        </div>
+                    </section>
+
+                    <!-- Statistics -->
+                    <section class="card stats-panel">
+                        <h2 class="card-title"><i class="fas fa-chart-bar"></i> Statistics</h2>
+                        <div class="stats-grid">
+                            <div class="stat-card stat-success">
+                                <div class="stat-icon"><i class="fas fa-check-circle"></i></div>
+                                <div class="stat-value" id="successCount">0</div>
+                                <div class="stat-label">Success</div>
+                            </div>
+                            <div class="stat-card stat-error">
+                                <div class="stat-icon"><i class="fas fa-times-circle"></i></div>
+                                <div class="stat-value" id="errorCount">0</div>
+                                <div class="stat-label">Errors</div>
+                            </div>
+                            <div class="stat-card stat-rate">
+                                <div class="stat-icon"><i class="fas fa-percentage"></i></div>
+                                <div class="stat-value" id="successRate">0%</div>
+                                <div class="stat-label">Success Rate</div>
+                            </div>
+                            <div class="stat-card stat-trades">
+                                <div class="stat-icon"><i class="fas fa-exchange-alt"></i></div>
+                                <div class="stat-value" id="totalTrades">0</div>
+                                <div class="stat-label">Total Trades</div>
+                            </div>
+                            <div class="stat-card stat-pnl">
+                                <div class="stat-icon"><i class="fas fa-dollar-sign"></i></div>
+                                <div class="stat-value" id="totalPnl">$0.00</div>
+                                <div class="stat-label">Total P&L</div>
+                            </div>
+                            <div class="stat-card stat-open">
+                                <div class="stat-icon"><i class="fas fa-folder-open"></i></div>
+                                <div class="stat-value" id="openPositions">0</div>
+                                <div class="stat-label">Open Positions</div>
+                            </div>
+                        </div>
+                    </section>
+                </div>
+
+                <!-- Right: Logs & Trades -->
+                <div class="column">
+                    <!-- Live Logs -->
+                    <section class="card log-panel">
+                        <div class="card-header-flex">
+                            <h2 class="card-title"><i class="fas fa-terminal"></i> Live Logs</h2>
+                            <div class="log-controls">
+                                <select id="logLevelFilter" class="filter-select">
+                                    <option value="ALL">All Levels</option>
+                                    <option value="INFO">INFO</option>
+                                    <option value="SUCCESS">SUCCESS</option>
+                                    <option value="WARNING">WARNING</option>
+                                    <option value="ERROR">ERROR</option>
+                                    <option value="CRITICAL">CRITICAL</option>
+                                </select>
+                                <button class="btn btn-sm btn-secondary" id="clearLogsBtn">
+                                    <i class="fas fa-broom"></i> Clear
+                                </button>
+                            </div>
+                        </div>
+                        <div class="log-container" id="logContainer"></div>
+                    </section>
+
+                    <!-- Trade History -->
+                    <section class="card trade-panel">
+                        <div class="card-header-flex">
+                            <h2 class="card-title"><i class="fas fa-history"></i> Trade History</h2>
+                            <button class="btn btn-sm btn-secondary" id="refreshTradesBtn">
+                                <i class="fas fa-sync-alt"></i> Refresh
+                            </button>
+                        </div>
+                        <div class="table-container">
+                            <table class="trade-table" id="tradeTable">
+                                <thead>
+                                    <tr>
+                                        <th>Ticket</th>
+                                        <th>Symbol</th>
+                                        <th>Direction</th>
+                                        <th>Entry</th>
+                                        <th>SL</th>
+                                        <th>TP</th>
+                                        <th>Lot</th>
+                                        <th>Status</th>
+                                        <th>P&L</th>
+                                        <th>Time</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="tradeTableBody"></tbody>
+                            </table>
+                        </div>
+                    </section>
+                </div>
+            </div>
+        </section>
+
+    </main>
+
+    <!-- Footer -->
+    <footer class="footer">
+        <div class="footer-left">
+            <span>Impulse AI Analyst v2.0.0</span>
+            <span class="separator">|</span>
+            <span id="lastUpdate">Last update: --</span>
+        </div>
+        <div class="footer-right">
+            <span>Built with FastAPI + SQLite + Plotly</span>
+        </div>
+    </footer>
+
+    <!-- Toast Notification -->
+    <div class="toast-container" id="toastContainer"></div>
+
+    <script src="/static/js/dashboard.js"></script>
+</body>
+
+</html>
