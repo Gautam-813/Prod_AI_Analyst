@@ -839,13 +839,30 @@ def check_password():
         entered_username = st.session_state.username_input
         entered_password = st.session_state.password_input
         
-        try:
-            with open("users.json", "r") as f:
-                user_db = json.load(f)
+        # Resolve user database: First check Environment Variable (Safe for Public Repo), then fall back to local file
+        user_db = None
+        user_db_env = os.environ.get("USER_DB_JSON")
+        
+        if user_db_env:
+            try:
+                user_db = json.loads(user_db_env)
                 users = user_db.get("users", [])
-        except Exception as e:
-            st.error(f"Error loading user database: {e}")
-            return
+            except Exception as e:
+                st.error(f"Error parsing USER_DB_JSON environment variable: {e}")
+                return
+        
+        if not user_db:
+            try:
+                if os.path.exists("users.json"):
+                    with open("users.json", "r") as f:
+                        user_db = json.load(f)
+                        users = user_db.get("users", [])
+                else:
+                    st.error("User database not found (Check USER_DB_JSON or users.json)")
+                    return
+            except Exception as e:
+                st.error(f"Error loading local user database: {e}")
+                return
             
         # Validate credentials
         found_user = next((u for u in users if u["username"] == entered_username and u["password"] == entered_password), None)

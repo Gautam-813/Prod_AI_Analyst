@@ -6,8 +6,9 @@
 MA_Impulse_Logger.ex5
 MA_Impulse_Logger.mq5
 
-# Exclude local Streamlit secrets
+# Exclude local Streamlit secrets and user databases
 .streamlit/secrets.toml
+users.json
 
 # Exclude Python cache
 __pycache__/
