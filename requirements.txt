@@ -11,7 +11,8 @@ scikit-learn
 scipy
 pygwalker
 streamlit-aggrid
-pandas-ta @ https://github.com/twopirllc/pandas-ta/archive/refs/heads/development.zip
+pandas-ta==0.3.14b0
+numba==0.61.2
 statsmodels
 QuantStats
 duckdb
