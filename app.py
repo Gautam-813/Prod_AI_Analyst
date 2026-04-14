@@ -91,6 +91,21 @@ if 'autopilot_error_count' not in st.session_state:
 if 'autopilot_success_count' not in st.session_state:
     st.session_state.autopilot_success_count = 0
 
+# ============================================================================
+# 🛡️ MEMORY-SAFE CACHED DATA LOADER (Fixes Render OOM Crashes)
+# ============================================================================
+@st.cache_data(ttl=1800, show_spinner=False)
+def cached_load_from_hf(repo_id: str, symbol: str, hf_token: str):
+    """
+    Cached wrapper for load_from_hf.
+    - Shared across ALL user sessions on the Render server.
+    - Data is downloaded ONCE and reused for 30 minutes (ttl=1800).
+    - Prevents the same parquet file being loaded into RAM multiple times,
+      which was causing the Render OOM (Out of Memory) crashes.
+    """
+    from data_sync import load_from_hf
+    return load_from_hf(repo_id, symbol, hf_token)
+
 # --- HIGH-SPEED CACHING ---
 @st.cache_data(ttl=3600)
 def get_cached_symbol_info(m_url, m_tok, symbol):
@@ -538,8 +553,15 @@ def process_ai_query(prompt, df, model_choice, api_key, model_provider, history_
                     snap_id = f"snap_{int(time.time())}"
                     st.session_state.data_vault[snap_id] = snapshot
                     msg_to_store["snapshot_id"] = snap_id
+                    # 🛡️ MEMORY GUARD: Cap vault at 5 snapshots to prevent Render OOM
+                    if len(st.session_state.data_vault) > 5:
+                        oldest_key = next(iter(st.session_state.data_vault))
+                        del st.session_state.data_vault[oldest_key]
                 
                 history.append(msg_to_store)
+                # 🛡️ MEMORY GUARD: Cap chat history at 20 messages to prevent RAM growth
+                if len(history) > 20:
+                    history.pop(0)
                 # ✅ DO NOT call st.rerun() here.
                 # On Render/cloud, st.rerun() after streaming causes the output
                 # to DISAPPEAR because it wipes the page before the user sees it.
@@ -1622,10 +1644,11 @@ if "Historical" in view_mode:
             # ── STEP 1: Fetch existing data from Hugging Face Hub ───────────────
             if "Cloud Hub" in source:
                 if hf_repo and hf_token:
-                    from data_sync import load_from_hf
                     with st.spinner(f"📥 Step 1/3 — Fetching existing data for {symbol_choice} from Hugging Face Hub..."):
                         try:
-                            hub_df = load_from_hf(hf_repo, symbol_choice, hf_token)
+                            # ✅ Use cached loader — prevents same parquet being loaded into RAM
+                            # multiple times across sessions (was the root cause of Render OOM)
+                            hub_df = cached_load_from_hf(hf_repo, symbol_choice, hf_token)
                             hf_rows_before = len(hub_df)
                             st.session_state.df = hub_df
                             st.session_state[f"df_{symbol_choice}"] = hub_df
