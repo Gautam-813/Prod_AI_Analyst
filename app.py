@@ -1618,149 +1618,59 @@ view_mode = st.radio(
 st.markdown("---")
 
 if "Historical" in view_mode:
-    st.markdown("### 📥 Select Archive Dataset")
-    colA, colD, colB, colC = st.columns([1.5, 1.5, 2, 1])
+    st.markdown("### 📥 Load Recent Market Data (7-Day 1M)")
+    colA, colB, colC = st.columns([1.5, 2.5, 1])
     with colA:
         symbol_choice = st.selectbox(
             "Select Symbol", 
             ["XAUUSD", "EURUSD", "DXY"],
             label_visibility="collapsed"
         )
-    with colD:
-        lookback_choice = st.selectbox(
-            "Lookback Period",
-            ["Last 7 Days", "Last 30 Days", "Last 3 Months", "Last 6 Months", "1 Year", "All Data"],
-            index=1,
-            help="Select how much data to load into the UI to save memory.",
-            label_visibility="collapsed"
-        )
     with colB:
-        if st.button(f"🚀 Load {symbol_choice} Data", width="stretch"):
+        if st.button(f"🚀 Fetch Last 7 Days ({symbol_choice})", width="stretch"):
             st.session_state.current_symbol_view = symbol_choice
-            source = st.session_state.get("data_source_priority", "☁️ Cloud Hub")
-            load_success = False
-            hf_rows_before = 0
-
-            # ── STEP 1: Fetch existing data from Hugging Face Hub ───────────────
-            if "Cloud Hub" in source:
-                if hf_repo and hf_token:
-                    with st.spinner(f"📥 Step 1/3 — Fetching existing data for {symbol_choice} from Hugging Face Hub..."):
-                        try:
-                            # ✅ Use cached loader — prevents same parquet being loaded into RAM
-                            # multiple times across sessions (was the root cause of Render OOM)
-                            hub_df = cached_load_from_hf(hf_repo, symbol_choice, hf_token)
-                            hf_rows_before = len(hub_df)
-                            current_df_temp = hub_df
-                            st.session_state.file_name = f"Cloud_{symbol_choice}_Data"
-                            st.info(f"☁️ Loaded **{hf_rows_before:,} rows** from Hugging Face Hub.")
-                            load_success = True
-                        except Exception as e:
-                            st.warning(f"⚠️ Cloud Hub fetch failed: {e}. Trying local disk...")
-
-            # Fallback to local disk
-            if not load_success:
-                import os
-                filename = f"{symbol_choice}_M1_Data.parquet"
-                if os.path.exists(filename):
-                    with st.spinner(f"Loading {filename} from local disk..."):
-                        try:
-                            disk_df = pd.read_parquet(filename)
-                            hf_rows_before = len(disk_df)
-                            current_df_temp = disk_df
-                            st.session_state.file_name = filename
-                            st.info(f"💾 Loaded **{hf_rows_before:,} rows** from local disk.")
-                            load_success = True
-                        except Exception as e:
-                            st.warning(f"⚠️ Local file error: {e}")
-
-            if not load_success:
-                st.error(f"❌ No data found for {symbol_choice} on Hugging Face Hub OR Local Disk!")
-            else:
-                current_df = current_df_temp
-
-                # ── STEP 2: Detect gap & fetch new data ─────────────────────────
-                from data_sync import get_gap_info
-                gap = get_gap_info(current_df)
-
-                if gap["gap_hours"] <= 0.25:
-                    st.success(f"✅ {symbol_choice} data is already fresh ({gap['label']}). No sync needed.")
-                elif symbol_choice in YAHOO_MAPPING:
-                    target_yh = YAHOO_MAPPING[symbol_choice]
-                    st.info(f"🕐 Gap detected: **{gap['label']}**. Fetching new candles from Yahoo Finance ({target_yh})...")
-
-                    with st.spinner(f"📡 Step 2/3 — Fetching new {symbol_choice} candles (last 7 days) from Yahoo Finance..."):
-                        try:
-                            from data_sync import sync_yahoo_symbol
-                            # sync_yahoo_symbol already:
-                            #   1. Fetches new data from Yahoo
-                            #   2. Loads existing from HF Hub
-                            #   3. Merges (dedup + sort)
-                            #   4. Pushes the merged result back to HF Hub
-                            sync_df, sync_stats = sync_yahoo_symbol(
-                                hf_repo, target_yh, hf_token,
-                                existing_df=current_df   # ← pass already-loaded HF data; skips redundant re-download
+            
+            from data_sync import YAHOO_MAPPING
+            target_yh = YAHOO_MAPPING.get(symbol_choice)
+            
+            if target_yh:
+                import yfinance as yf
+                with st.spinner(f"📡 Fetching live 1m data for {symbol_choice} from Yahoo Finance..."):
+                    try:
+                        ticker = yf.Ticker(target_yh)
+                        # Fetch the last 7 days of 1-minute data
+                        new_df = ticker.history(period="7d", interval="1m")
+                        
+                        if not new_df.empty:
+                            new_df = new_df.reset_index()
+                            time_col = next(
+                                (c for c in new_df.columns if c.lower() in ("datetime", "date")),
+                                new_df.columns[0]
                             )
-
-                            hf_rows_after = len(sync_df)
-                            new_rows_added = hf_rows_after - hf_rows_before
-
-                            # ── STEP 3: Merged result handled below ────────
-
-                            # Build detailed report
-                            report = (
-                                f"✅ **Merge Successful & Pushed to Hub!**\n\n"
-                                f"- **Rows Before:** {hf_rows_before:,}  (Last candle: {gap.get('last_timestamp', 'Unknown')})\n"
-                                f"- **Delta Fetched:** +{new_rows_added:,} new rows\n"
-                                f"- **Sync Range:** {sync_df['time'].iloc[-(new_rows_added+1)] if new_rows_added > 0 else 'N/A'} → {sync_df['time'].iloc[-1]}\n"
-                                f"- **Total Rows now on Hub:** {hf_rows_after:,}"
-                            )
-                            st.success(report)
-                            st.toast(f"🚀 {symbol_choice} synced! +{new_rows_added:,} rows.")
+                            new_df = new_df.rename(columns={
+                                time_col:       'time',
+                                'Open':         'open',
+                                'High':         'high',
+                                'Low':          'low',
+                                'Close':        'close',
+                                'Volume':       'tick_volume',
+                            })
+                            new_df['time'] = pd.to_datetime(new_df['time'], utc=True)
+                            new_df.columns = [c.lower() for c in new_df.columns]
                             
-                            # Use the freshly synced dataframe as our current_df
-                            current_df = sync_df
-
-                        except Exception as yh_err:
-                            st.warning(f"⚠️ Auto-sync skipped (Yahoo Finance unreachable or no new data): {yh_err}")
-                            st.info("Displaying existing Hub data as-is.")
-                else:
-                    st.warning(f"⚠️ Gap of **{gap['label']}** detected but no Yahoo Finance mapping for {symbol_choice}. Use MT5 Sync instead.")
-
-                # ── STEP 4: Apply memory-safe lookback filter ────────────────────────
-                # 🛡️ CRITICAL MEMORY FIX: Only store the filtered slice in session_state
-                time_cols = [c for c in current_df.columns if 'time' in c.lower() or 'date' in c.lower()]
-                if time_cols and lookback_choice != "All Data":
-                    time_col = time_cols[0]
-                    current_df[time_col] = pd.to_datetime(current_df[time_col], utc=False, errors='coerce')
-                    max_time = current_df[time_col].max()
-                    
-                    if lookback_choice == "Last 7 Days":
-                        cutoff = max_time - pd.Timedelta(days=7)
-                    elif lookback_choice == "Last 30 Days":
-                        cutoff = max_time - pd.Timedelta(days=30)
-                    elif lookback_choice == "Last 3 Months":
-                        cutoff = max_time - pd.Timedelta(days=90)
-                    elif lookback_choice == "Last 6 Months":
-                        cutoff = max_time - pd.Timedelta(days=180)
-                    elif lookback_choice == "1 Year":
-                        cutoff = max_time - pd.Timedelta(days=365)
-                    
-                    # Filter down to save memory
-                    memory_safe_df = current_df[current_df[time_col] >= cutoff].reset_index(drop=True)
-                    st.session_state.df = memory_safe_df
-                    st.session_state[f"df_{symbol_choice}"] = memory_safe_df
-                    st.info(f"✂️ UI Memory Safe Mode: Loaded **{len(memory_safe_df):,}** rows ({lookback_choice}) out of **{len(current_df):,}** total.")
-                else:
-                    # User chose "All Data" (or time col not found)
-                    # 🛡️ HARD CAP at 10,000 to prevent Render OOM
-                    memory_safe_df = current_df.tail(10000).reset_index(drop=True)
-                    st.session_state.df = memory_safe_df
-                    st.session_state[f"df_{symbol_choice}"] = memory_safe_df
-                    if True:
-                        st.info(f"⚠️ Capped dataset to exactly **{len(memory_safe_df):,}** rows out of {len(current_df):,} total to protect cloud memory.")
-
-                st.session_state.messages = []
-                st.rerun()
+                            st.session_state.df = new_df
+                            st.session_state[f"df_{symbol_choice}"] = new_df
+                            st.session_state.file_name = f"YahooFinance_{symbol_choice}_7D"
+                            st.success(f"✅ Successfully loaded **{len(new_df):,}** rows directly into UI memory (Zero OOM risk!).")
+                        else:
+                            st.error(f"❌ Yahoo Finance returned 0 rows for {symbol_choice}. Markets might be closed.")
+                    except Exception as e:
+                        st.error(f"⚠️ Failed to fetch data from Yahoo Finance: {e}")
+            else:
+                st.error(f"⚠️ No Yahoo Finance mapping defined for {symbol_choice} (Check data_sync.py).")
+            
+            st.session_state.messages = []
+            st.rerun()
 
     with colC:
         if st.button("🧹 Clear Workspace", width="stretch"):
