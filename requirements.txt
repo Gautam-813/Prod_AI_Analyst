@@ -1,4 +1,4 @@
-streamlit==1.32.0
+streamlit
 pandas
 numpy
 pyarrow
@@ -11,7 +11,7 @@ scikit-learn
 scipy
 pygwalker
 streamlit-aggrid
-pandas-ta-classic==0.4.47
+pandas-ta-classic
 statsmodels
 QuantStats
 duckdb==0.9.2
