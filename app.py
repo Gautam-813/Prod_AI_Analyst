@@ -9,6 +9,8 @@ import requests
 import json
 import io
 import sys
+import time
+import traceback
 import contextlib
 import plotly.express as px
 import plotly.graph_objects as go
@@ -41,6 +43,29 @@ if 'api_session' not in st.session_state:
 
 def get_session():
     return st.session_state.api_session
+
+# --- SAFE SECRET RESOLVER (Works on Render and Local) ---
+def get_secret(key, default=""):
+    """Safely retrieves a secret from Environment Variables (Render) or st.secrets (Local)."""
+    # 1. Try Environment Variables (Primary for Render)
+    try:
+        val = os.environ.get(key)
+        if val:
+            return val
+    except:
+        pass
+
+    # 2. Try Streamlit Secrets (Secondary for Local)
+    try:
+        # Wrap everything in a try-except because st.secrets can throw 
+        # StreamlitSecretNotFoundError just by being accessed/checked.
+        if key in st.secrets:
+            return st.secrets.get(key, default)
+    except Exception:
+        # If secrets.toml is missing and no secrets are set, Streamlit raises an error
+        pass
+
+    return default
 
 # --- CALLBACK STATES ---
 if 'executing' not in st.session_state:
@@ -144,7 +169,7 @@ def master_audit_log(action_type, details):
         url = "https://script.google.com/macros/s/AKfycbxtd5reNGnPATB7oCWRtwYYO_BKMb55HwdemU5nw5MwkguSIlL8uV1maT8BkcK0TElz6A/exec"
         
         # Priority: Check if URL is in secrets (for production), otherwise use hardcoded
-        webhook_url = st.secrets.get("GSHEETS_LOG_URL", url)
+        webhook_url = get_secret("GSHEETS_LOG_URL", url)
 
         # Capture source info
         try:
@@ -827,64 +852,67 @@ st.markdown("""
 
 # Password Protection
 # Password Protection & Multi-User Auth
+# --- 🛡️ AUTHENTICATION SYSTEM (Refactored) ---
+def log_access(username):
+    """Log successful login attempt with source information."""
+    master_audit_log("LOGIN", f"Successfully logged into station: {username}")
+
+def handle_login_request():
+    """Top-level handler for login authentication logic."""
+    import os
+    import json
+    
+    entered_username = st.session_state.username_input
+    entered_password = st.session_state.password_input
+    
+    # Resolve user database: First check Environment Variable (Safe for Public Repo), then fall back to local file
+    user_db = None
+    user_db_env = os.environ.get("USER_DB_JSON")
+    
+    if user_db_env:
+        try:
+            user_db = json.loads(user_db_env)
+            users = user_db.get("users", [])
+        except Exception as e:
+            st.error(f"Error parsing USER_DB_JSON environment variable: {e}")
+            return
+    
+    if not user_db:
+        try:
+            if os.path.exists("users.json"):
+                with open("users.json", "r") as f:
+                    user_db = json.load(f)
+                    users = user_db.get("users", [])
+            else:
+                st.error("User database not found (Check USER_DB_JSON or users.json)")
+                return
+        except Exception as e:
+            st.error(f"Error loading local user database: {e}")
+            return
+        
+    # Validate credentials
+    found_user = next((u for u in users if u["username"] == entered_username and u["password"] == entered_password), None)
+    
+    if found_user:
+        st.session_state.authenticated = True
+        st.session_state.user_name = found_user.get("name", entered_username)
+        st.session_state.username = entered_username
+        log_access(entered_username)
+        st.toast(f"Welcome back, {st.session_state.user_name}!")
+    else:
+        st.session_state.login_error = True
+
+def handle_logout_request():
+    st.session_state.authenticated = False
+    st.session_state.login_error = False
+    st.session_state.username_input = ""
+    st.session_state.password_input = ""
+    st.rerun()
+
 def check_password():
     """Check if the user has entered a valid username and password."""
     if "authenticated" not in st.session_state:
         st.session_state.authenticated = False
-    
-    def log_access(username):
-        """Log successful login attempt with source information."""
-        master_audit_log("LOGIN", "Successfully logged into station")
-
-    def login():
-        import os
-        import json
-        entered_username = st.session_state.username_input
-        entered_password = st.session_state.password_input
-        
-        # Resolve user database: First check Environment Variable (Safe for Public Repo), then fall back to local file
-        user_db = None
-        user_db_env = os.environ.get("USER_DB_JSON")
-        
-        if user_db_env:
-            try:
-                user_db = json.loads(user_db_env)
-                users = user_db.get("users", [])
-            except Exception as e:
-                st.error(f"Error parsing USER_DB_JSON environment variable: {e}")
-                return
-        
-        if not user_db:
-            try:
-                if os.path.exists("users.json"):
-                    with open("users.json", "r") as f:
-                        user_db = json.load(f)
-                        users = user_db.get("users", [])
-                else:
-                    st.error("User database not found (Check USER_DB_JSON or users.json)")
-                    return
-            except Exception as e:
-                st.error(f"Error loading local user database: {e}")
-                return
-            
-        # Validate credentials
-        found_user = next((u for u in users if u["username"] == entered_username and u["password"] == entered_password), None)
-        
-        if found_user:
-            st.session_state.authenticated = True
-            st.session_state.user_name = found_user.get("name", entered_username)
-            st.session_state.username = entered_username
-            log_access(entered_username)
-            st.toast(f"Welcome back, {st.session_state.user_name}!")
-        else:
-            st.session_state.login_error = True
-    
-    def logout():
-        st.session_state.authenticated = False
-        st.session_state.login_error = False
-        st.session_state.username_input = ""
-        st.session_state.password_input = ""
-        st.rerun()
     
     if not st.session_state.authenticated:
         st.markdown("""
@@ -925,7 +953,7 @@ def check_password():
                 placeholder="Enter password"
             )
             
-            if st.button("🚀 Enter Station", width="stretch", on_click=login):
+            if st.button("🚀 Enter Station", width="stretch", on_click=handle_login_request):
                 pass
 
             if st.session_state.get("login_error", False):
@@ -937,7 +965,7 @@ def check_password():
     with st.sidebar:
         st.markdown(f"#### 👤 User: {st.session_state.get('user_name', 'Unknown')}")
         if st.button("🚪 Logout Session", width="stretch"):
-            logout()
+            handle_logout_request()
         st.markdown("---")
         
         # EA Files Download
@@ -990,7 +1018,7 @@ with st.sidebar:
     elif provider_choice == "GitHub Models":
         secret_key_name = "GITHUB_API_KEY"
     
-    api_key_to_use = input_api_key if input_api_key else st.secrets.get(secret_key_name, "")
+    api_key_to_use = input_api_key if input_api_key else get_secret(secret_key_name, "")
     
     if provider_choice == "NVIDIA":
         model_choice = st.selectbox("Select Model", [
@@ -1108,10 +1136,10 @@ with st.sidebar:
 
     # --- ⚡ AUTO-SYNC & CREDENTIALS ---
     # These MUST be defined before autopilot control center
-    hf_repo  = st.secrets.get("HF_REPO_ID", "")
-    hf_token = st.secrets.get("HuggingFace_API_KEY", "")
+    hf_repo  = get_secret("HF_REPO_ID", "")
+    hf_token = get_secret("HuggingFace_API_KEY", "")
     mt5_url = st.session_state.get("mt5_url", "http://localhost:5000")
-    mt5_token = st.secrets.get("MT5_API_TOKEN", "impulse_secure_2026")
+    mt5_token = get_secret("MT5_API_TOKEN", "impulse_secure_2026")
 
     # 🚀 --- AUTOPILOT CONTROL CENTER ---
     st.markdown("---")
@@ -1762,7 +1790,7 @@ elif "Live" in view_mode:
                                      key="live_mt5_url")
         with c2:
             mt5_tok_in = st.text_input("Security Token", 
-                                     value=st.secrets.get("MT5_API_TOKEN", "impulse_secure_2026"), 
+                                     value=get_secret("MT5_API_TOKEN", "impulse_secure_2026"), 
                                      type="password",
                                      key="live_mt5_token")
             
@@ -1782,7 +1810,7 @@ elif "Live" in view_mode:
     # ── STEP 2: Main Terminal (Only if bridge is active) ──────────────────
     if st.session_state.get("mt5_connected"):
         m_url = st.session_state.get("mt5_url", "http://localhost:5000")
-        m_tok = st.secrets.get("MT5_API_TOKEN", "impulse_secure_2026")
+        m_tok = get_secret("MT5_API_TOKEN", "impulse_secure_2026")
 
         # ── MULTI-TAB ARCHITECTURE ────────────────────────────────────────
         t_live, t_perf, t_intel = st.tabs(["📺 Live Terminal", "📜 Trade History", "🌐 Market Intel"])
@@ -1818,7 +1846,7 @@ elif "Live" in view_mode:
             @st.fragment(run_every=60 if live_active else None)
             def live_chart_fragment(symbol, timeframe, count, active):
                 m_url_f = st.session_state.get("mt5_url", "http://localhost:5000")
-                m_tok_f = st.secrets.get("MT5_API_TOKEN", "impulse_secure_2026")
+                m_tok_f = get_secret("MT5_API_TOKEN", "impulse_secure_2026")
                 from data_sync import pull_mt5_latest
                 # Use directly outside to be safe
                 df_l = pull_mt5_latest(m_url_f, symbol, timeframe, count, m_tok_f)
@@ -1842,7 +1870,7 @@ elif "Live" in view_mode:
             @st.fragment(run_every=1000)
             def position_manager_fragment():
                 pm_url = st.session_state.get("mt5_url", "http://localhost:5000")
-                pm_tok = st.secrets.get("MT5_API_TOKEN", "impulse_secure_2026")
+                pm_tok = get_secret("MT5_API_TOKEN", "impulse_secure_2026")
                 try:
                     summary = fetch_open_positions(pm_url, pm_tok)
                 except Exception: return
@@ -1951,7 +1979,7 @@ elif "Live" in view_mode:
             @st.fragment(run_every=10) # 10 SECONDS
             def live_performance_fragment():
                 p_url = st.session_state.get("mt5_url", "http://localhost:5000")
-                p_tok = st.secrets.get("MT5_API_TOKEN", "impulse_secure_2026")
+                p_tok = get_secret("MT5_API_TOKEN", "impulse_secure_2026")
                 render_performance_tab(p_url, p_tok)
             
             live_performance_fragment()
