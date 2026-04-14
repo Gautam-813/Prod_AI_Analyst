@@ -540,7 +540,11 @@ def process_ai_query(prompt, df, model_choice, api_key, model_provider, history_
                     msg_to_store["snapshot_id"] = snap_id
                 
                 history.append(msg_to_store)
-                st.rerun()
+                # ✅ DO NOT call st.rerun() here.
+                # On Render/cloud, st.rerun() after streaming causes the output
+                # to DISAPPEAR because it wipes the page before the user sees it.
+                # The message is already in session_state — Streamlit will render
+                # it correctly on the next natural interaction.
 
             except Exception as e:
                 st.error(f"API Error: {e}")
