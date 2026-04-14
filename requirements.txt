@@ -9,12 +9,12 @@ openai
 requests
 scikit-learn
 scipy
-pygwalker
+pygwalker>=0.4.8
 streamlit-aggrid
 pandas-ta-classic
 statsmodels
 QuantStats
-duckdb==0.9.2
+duckdb
 polars
 altair
 xgboost
