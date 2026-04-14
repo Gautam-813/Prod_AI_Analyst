@@ -1650,8 +1650,7 @@ if "Historical" in view_mode:
                             # multiple times across sessions (was the root cause of Render OOM)
                             hub_df = cached_load_from_hf(hf_repo, symbol_choice, hf_token)
                             hf_rows_before = len(hub_df)
-                            st.session_state.df = hub_df
-                            st.session_state[f"df_{symbol_choice}"] = hub_df
+                            current_df_temp = hub_df
                             st.session_state.file_name = f"Cloud_{symbol_choice}_Data"
                             st.info(f"☁️ Loaded **{hf_rows_before:,} rows** from Hugging Face Hub.")
                             load_success = True
@@ -1667,7 +1666,7 @@ if "Historical" in view_mode:
                         try:
                             disk_df = pd.read_parquet(filename)
                             hf_rows_before = len(disk_df)
-                            st.session_state.df = disk_df
+                            current_df_temp = disk_df
                             st.session_state.file_name = filename
                             st.info(f"💾 Loaded **{hf_rows_before:,} rows** from local disk.")
                             load_success = True
@@ -1677,7 +1676,7 @@ if "Historical" in view_mode:
             if not load_success:
                 st.error(f"❌ No data found for {symbol_choice} on Hugging Face Hub OR Local Disk!")
             else:
-                current_df = st.session_state.df
+                current_df = current_df_temp
 
                 # ── STEP 2: Detect gap & fetch new data ─────────────────────────
                 from data_sync import get_gap_info
@@ -1705,9 +1704,7 @@ if "Historical" in view_mode:
                             hf_rows_after = len(sync_df)
                             new_rows_added = hf_rows_after - hf_rows_before
 
-                            # ── STEP 3: Update session with merged result ────────
-                            st.session_state.df = sync_df
-                            st.session_state[f"df_{symbol_choice}"] = sync_df
+                            # ── STEP 3: Merged result handled below ────────
 
                             # Build detailed report
                             report = (
@@ -1730,6 +1727,7 @@ if "Historical" in view_mode:
                     st.warning(f"⚠️ Gap of **{gap['label']}** detected but no Yahoo Finance mapping for {symbol_choice}. Use MT5 Sync instead.")
 
                 # ── STEP 4: Apply memory-safe lookback filter ────────────────────────
+                # 🛡️ CRITICAL MEMORY FIX: Only store the filtered slice in session_state
                 time_cols = [c for c in current_df.columns if 'time' in c.lower() or 'date' in c.lower()]
                 if time_cols and lookback_choice != "All Data":
                     time_col = time_cols[0]
@@ -1751,12 +1749,15 @@ if "Historical" in view_mode:
                     memory_safe_df = current_df[current_df[time_col] >= cutoff].reset_index(drop=True)
                     st.session_state.df = memory_safe_df
                     st.session_state[f"df_{symbol_choice}"] = memory_safe_df
-                    st.info(f"✂️ UI Memory Safe Mode: Loaded **{len(memory_safe_df):,}** rows ({lookback_choice}) out of **{len(current_df):,}** total.)")
+                    st.info(f"✂️ UI Memory Safe Mode: Loaded **{len(memory_safe_df):,}** rows ({lookback_choice}) out of **{len(current_df):,}** total.")
                 else:
                     # User chose "All Data" (or time col not found)
-                    st.session_state.df = current_df
-                    st.session_state[f"df_{symbol_choice}"] = current_df
-                    st.info(f"⚠️ Loaded FULL dataset into UI memory: **{len(current_df):,}** rows.")
+                    # 🛡️ HARD CAP at 10,000 to prevent Render OOM
+                    memory_safe_df = current_df.tail(10000).reset_index(drop=True)
+                    st.session_state.df = memory_safe_df
+                    st.session_state[f"df_{symbol_choice}"] = memory_safe_df
+                    if True:
+                        st.info(f"⚠️ Capped dataset to exactly **{len(memory_safe_df):,}** rows out of {len(current_df):,} total to protect cloud memory.")
 
                 st.session_state.messages = []
                 st.rerun()
