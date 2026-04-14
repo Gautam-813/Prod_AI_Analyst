@@ -19,7 +19,7 @@ import scipy
 import altair as alt
 import sklearn
 from openai import OpenAI
-import pandas_ta as ta
+import pandas_ta_classic as ta
 import statsmodels.api as sm
 import quantstats as qs
 import duckdb
