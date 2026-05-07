@@ -1,7 +1,16 @@
-
 [server]
 # Disables file watching to save server resources and prevent inotify errors
 fileWatcherType = "none"
 
 [browser]
 gatherUsageStats = false
+
+[theme]
+backgroundColor = "#0d1117"
+secondaryBackgroundColor = "#161b22"
+textColor = "#f0f6fc"
+font = "Sans serif"
+
+[theme.expander]
+backgroundColor = "#161b22"
+borderColor = "#30363d"

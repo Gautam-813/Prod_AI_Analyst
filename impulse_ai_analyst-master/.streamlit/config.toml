@@ -1,7 +1,0 @@
-
-[server]
-# Disables file watching to save server resources and prevent inotify errors
-fileWatcherType = "none"
-
-[browser]
-gatherUsageStats = false

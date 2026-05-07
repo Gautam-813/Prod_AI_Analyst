@@ -12,7 +12,9 @@
       "Bash(netstat *)",
       "Bash(tasklist)",
       "Bash(start *)",
-      "Bash(type *)"
+      "Bash(type *)",
+      "Bash(dir *)",
+      "Bash(powershell *)"
     ]
   },
   "$version": 3

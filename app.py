@@ -33,6 +33,111 @@ import contextlib
 import io
 from streamlit_autorefresh import st_autorefresh
 from data_sync import pull_mt5_latest, ping_mt5_server
+from memory_system import load_all_memory, save_conversation_summary, save_insight, save_preference, update_stats, build_memory_context, save_feedback, load_feedback, get_feedback_stats
+from login_page import check_auth
+
+# ============================================================================
+# News Detection & Fetching
+# ============================================================================
+NEWS_KEYWORDS = ["today", "news", "market", "performance", "sentiment", "fomc", "events", "latest", "current", "outlook", "update", "breaking", "economic", "currency", "forex"]
+
+COMMON_SYMBOLS = {
+    "gold": "XAUUSD", "xauusd": "XAUUSD", "xau": "XAUUSD",
+    "silver": "XAGUSD", "xagusd": "XAGUSD", "xag": "XAGUSD",
+    "eurusd": "EURUSD", "eur/usd": "EURUSD",
+    "gbpusd": "GBPUSD", "gbp/usd": "GBPUSD",
+    "usdjpy": "USDJPY", "usd/jpy": "USDJPY",
+    "audusd": "AUDUSD", "aud/usd": "AUDUSD",
+    "usdchf": "USDCHF", "usd/chf": "USDCHF",
+    "nzdusd": "NZDUSD", "nzd/usd": "NZDUSD",
+    "btc": "BTCUSD", "bitcoin": "BTCUSD",
+    "oil": "USOIL", "crude": "USOIL",
+    "sp500": "SPX", "spy": "SPX",
+    "nasdaq": "NDX", "nvda": "NVDA", "tesla": "TSLA", "apple": "AAPL"
+}
+
+def contains_news_keywords(text: str) -> bool:
+    """Check if the prompt contains news-related keywords."""
+    text_lower = text.lower()
+    return any(keyword in text_lower for keyword in NEWS_KEYWORDS)
+
+def extract_symbol_from_prompt(prompt: str) -> str:
+    """Extract trading symbol from the user's prompt using dynamic broker symbols."""
+    prompt_upper = prompt.upper()
+    
+    # First: Check against broker's available symbols
+    available_syms = st.session_state.get("available_symbols", [])
+    if available_syms:
+        for sym in available_syms:
+            if sym in prompt_upper:
+                return sym
+    
+    # Fallback: Check common aliases
+    COMMON_ALIASES = {
+        "gold": "XAUUSD", "silver": "XAGUSD",
+        "eurusd": "EURUSD", "gbpusd": "GBPUSD",
+        "usdjpy": "USDJPY", "audusd": "AUDUSD",
+        "btc": "BTCUSD", "bitcoin": "BTCUSD",
+    }
+    prompt_lower = prompt.lower()
+    for name, symbol in COMMON_ALIASES.items():
+        if name in prompt_lower:
+            return symbol
+    
+    # Fallback: Regex for common symbols
+    import re
+    pattern = r'\b([A-Z]{2,6})\b'
+    matches = re.findall(pattern, prompt_upper)
+    for match in matches:
+        if match in ["XAU", "EUR", "GBP", "USD", "JPY", "AUD", "CHF", "NZD", "BTC", "SPX", "NDX"]:
+            symbol_map = {"XAU": "XAUUSD", "EUR": "EURUSD", "GBP": "GBPUSD", "USD": "USDJPY", "BTC": "BTCUSD", "SPX": "SPX", "NDX": "NDX"}
+            if match in symbol_map:
+                return symbol_map[match]
+    
+    return None
+
+def fetch_news_for_symbol(symbol: str) -> str:
+    """Fetch latest news for a symbol using Yahoo Finance."""
+    import yfinance as yf
+    
+    try:
+        ticker = yf.Ticker(symbol)
+        news = ticker.news
+        
+        if not news:
+            return None
+        
+        news_items = []
+        for item in news[:5]:
+            title = item.get("title", "")
+            publisher = item.get("publisher", "")
+            if title:
+                news_items.append(f"• {title} ({publisher})")
+        
+        if news_items:
+            return "\n".join(news_items)
+        return None
+    except Exception as e:
+        print(f"[News] Could not fetch news for {symbol}: {e}")
+        return None
+
+def build_news_context(prompt: str) -> str:
+    """Build news context for the AI prompt if user asks about news."""
+    if not contains_news_keywords(prompt):
+        return ""
+    
+    symbol = extract_symbol_from_prompt(prompt)
+    if not symbol:
+        return ""
+    
+    news = fetch_news_for_symbol(symbol)
+    if not news:
+        return ""
+    
+    return f"""
+📰 TODAY'S MARKET NEWS FOR {symbol}:
+{news}
+"""
 
 # ============================================================================
 # Trade Execution & Management Helpers
@@ -283,18 +388,19 @@ def build_trade_context(mt5_url, mt5_token):
     except Exception:
         pass
 
-    try:
-        history = fetch_trade_history(mt5_url, mt5_token, hours=24)
-        if history.get("deals"):
-            lines.append("[RECENT CLOSED TRADES (Last 24h)]")
-            for deal in history["deals"]:
-                if deal.get("entry") == "CLOSE":
-                    lines.append(
-                        f"Ticket: {deal['ticket']} | {deal['symbol']} {deal['direction']} | "
-                        f"Exit: {deal['price']} | P&L: ${deal['profit']:.2f} | Comment: {deal.get('comment', '')}"
-                    )
-    except Exception:
-        pass
+    # REMOVED: Recent closed trades removed per user request
+    # try:
+    #     history = fetch_trade_history(mt5_url, mt5_token, hours=24)
+    #     if history.get("deals"):
+    #         lines.append("[RECENT CLOSED TRADES (Last 24h)]")
+    #         for deal in history["deals"]:
+    #             if deal.get("entry") == "CLOSE":
+    #                 lines.append(
+    #                     f"Ticket: {deal['ticket']} | {deal['symbol']} {deal['direction']} | "
+    #                     f"Exit: {deal['price']} | P&L: ${deal['profit']:.2f} | Comment: {deal.get('comment', '')}"
+    #                 )
+    # except Exception:
+    #     pass
 
     return "\n".join(lines)
 
@@ -451,37 +557,71 @@ def render_action_card(action, mt5_url, mt5_token):
         if st.button("❌ Ignore", key=f"ignore_modify_{ticket}"):
             pass
 
+def filter_code_from_message(content):
+    """Remove Python code blocks and JSON from AI response for clean display."""
+    import re
+    if not content:
+        return content
+    # Remove markdown code blocks (```python ... ``` or ``` ... ```)
+    content = re.sub(r'```python[\s\S]*?```', '', content)
+    content = re.sub(r'```[\s\S]*?```', '', content)
+    # Remove import statements and code lines that start with import or have = in technical way
+    lines = content.split('\n')
+    filtered_lines = []
+    skip_code_lines = False
+    for line in lines:
+        # Skip lines that look like code (starting with import, df., np., st., etc.)
+        if any(line.strip().startswith(kw) for kw in ['import ', 'def ', 'class ', 'if __', 'for ', 'while ']):
+            continue
+        # Skip lines with multiple dots or brackets that indicate code
+        if re.search(r'df\.|np\.|st\.|go\.|pd\.\w+\(', line) and not line.startswith('#'):
+            continue
+        filtered_lines.append(line)
+    return '\n'.join(filtered_lines).strip()
+
 def process_ai_query(prompt, df, model_choice, api_key, model_provider, history_key="messages", base_url=None, snapshot=None):
     """Handles professional quantitative analysis queries using multi-modal AI reasoning."""
     if "messages_live" not in st.session_state: st.session_state.messages_live = []
     if "messages" not in st.session_state: st.session_state.messages = []
     
-    # Get correct history
+    # Load persistent memory on first query
+    if "memory_loaded" not in st.session_state:
+        st.session_state.memory = load_all_memory()
+        st.session_state.memory_loaded = True
+    
     history = st.session_state[history_key]
     history.append({"role": "user", "content": prompt})
     
-    # LOG PROMPT TO AUDIT
     master_audit_log("AI_QUERY", f"Prompt: {prompt}")
     
     with st.chat_message("user"): st.markdown(prompt)
     
     with st.chat_message("assistant"):
-        with st.spinner("AI Analyst is calculating..."):
+        with st.spinner("🧠 AI is analyzing your data..."):
             df_info = io.StringIO()
             df.info(buf=df_info)
             metadata = df_info.getvalue()
             
+            # Build memory context
+            memory_context = build_memory_context(st.session_state.memory)
+            
+            # Build news context if user asks about today's news
+            news_context = build_news_context(prompt)
+            
             system_prompt = f"""
             You are a Lead Quant in 2026. Use the provided DataFrame 'df' for your analysis.
+            
+            {memory_context}
+            {news_context}
+            
             SCHEMA: {metadata}
             LATEST_CANDLE_RECORDED: {df['time'].iloc[-1] if not df.empty and 'time' in df.columns else 'N/A'}
             SAMPLES (Last 5 Rows): {df.tail(5).to_string()}
             
             RULES (STRICT):
             1. Analyze only based on the provided data available in 'df'. Ignore local system time.
-            2. Provide executable Python code in ```python blocks.
-            3. Use 'st.write()', 'st.plotly_chart()' for results.
-             4. If you identify a trade opportunity, output a JSON block in ```json format:
+            2. Provide the analysis directly without code.
+            3. If you identify a trade opportunity, output the explanation and a JSON block in ```json format:
                ```json
                {{"action": "TRADE_SETUP", "symbol": "XAUUSD", "direction": "BUY", "order_type": "market", "entry_price": 2345.50, "stop_loss": 2338.00, "take_profit": 2360.00, "lot_size": 0.10, "risk_reward": 1.93, "reasoning": "Brief explanation"}}
                ```
@@ -493,20 +633,15 @@ def process_ai_query(prompt, df, model_choice, api_key, model_provider, history_
                Actions: CLOSE_POSITION, MODIFY_SL, MODIFY_TP, MODIFY_SLTP, ADD_TO_POSITION
             """
             
-            # Robust key/client handling
             final_key = api_key
             if model_provider == "NVIDIA" and not final_key.startswith("nvapi-"):
                 final_key = f"nvapi-{final_key}"
             
             client = OpenAI(base_url=base_url, api_key=final_key)
             full_txt = ""
-            ph = st.empty()
             
-            # 🧹 CLEAN HOUSE: Filter out non-serializable data snapshots from the API payload
             clean_history = []
             for m in history:
-                # We only send text 'role' and 'content' to the AI.
-                # We do NOT send the raw DataFrame snapshot.
                 clean_history.append({"role": m["role"], "content": m["content"]})
 
             messages = [{"role": "system", "content": system_prompt}] + clean_history
@@ -518,10 +653,7 @@ def process_ai_query(prompt, df, model_choice, api_key, model_provider, history_
                 for chunk in stream:
                     if chunk.choices[0].delta.content:
                         full_txt += chunk.choices[0].delta.content
-                        ph.markdown(full_txt + "▌")
-                ph.markdown(full_txt)
                 
-                # Execution and Self-Healing
                 code_pattern = r"```python(.*?)```"
                 blocks = re.findall(code_pattern, full_txt, re.S | re.I)
                 final_code = "\n\n".join([b.strip() for b in blocks]) if blocks else None
@@ -532,41 +664,74 @@ def process_ai_query(prompt, df, model_choice, api_key, model_provider, history_
                     if error:
                         st.error(f"Execution Error: {error}")
                 
+                if final_stdout:
+                    st.markdown("**📊 Analysis Complete:**")
+                else:
+                    st.markdown(full_txt)
+                
                 msg_to_store = {"role": "assistant", "content": full_txt}
                 if final_code: msg_to_store["code"] = final_code
                 if final_stdout: msg_to_store["exec_result"] = final_stdout
                 
-                # 🔍 TRADE SETUP DETECTION
                 setup = detect_trade_setup(full_txt)
                 if setup:
                     msg_to_store["detected_setup"] = setup
                 
-                # 🔍 TRADE ACTION DETECTION
                 action = detect_trade_action(full_txt)
                 if action:
                     msg_to_store["detected_action"] = action
                 
-                # 🛡️ GOLDEN VAULT: Store snapshot with a unique ID, not inside the message
                 if snapshot is not None:
                     if "data_vault" not in st.session_state: st.session_state.data_vault = {}
                     import time
                     snap_id = f"snap_{int(time.time())}"
                     st.session_state.data_vault[snap_id] = snapshot
                     msg_to_store["snapshot_id"] = snap_id
-                    # 🛡️ MEMORY GUARD: Cap vault at 5 snapshots to prevent Render OOM
                     if len(st.session_state.data_vault) > 5:
                         oldest_key = next(iter(st.session_state.data_vault))
                         del st.session_state.data_vault[oldest_key]
                 
                 history.append(msg_to_store)
-                # 🛡️ MEMORY GUARD: Cap chat history at 20 messages to prevent RAM growth
                 if len(history) > 20:
                     history.pop(0)
-                # ✅ DO NOT call st.rerun() here.
-                # On Render/cloud, st.rerun() after streaming causes the output
-                # to DISAPPEAR because it wipes the page before the user sees it.
-                # The message is already in session_state — Streamlit will render
-                # it correctly on the next natural interaction.
+                
+                # Save conversation to persistent memory
+                import time as time_module
+                conv_id = f"conv_{int(time_module.time())}"
+                detected_setup = msg_to_store.get("detected_setup")
+                detected_action = msg_to_store.get("detected_action")
+                
+                save_conversation_summary(conv_id, prompt, full_txt, detected_setup, detected_action)
+                
+                # Update memory stats
+                if detected_setup:
+                    st.session_state.memory = load_all_memory()
+                
+                # Feedback UI
+                st.markdown("---")
+                col_fb1, col_fb2 = st.columns([1, 2])
+                with col_fb1:
+                    st.caption("Was this response helpful?")
+                with col_fb2:
+                    fb_key = f"fb_{len(history)}"
+                    c1, c2, c3 = st.columns([1, 1, 2])
+                    with c1:
+                        if st.button("👍 Helpful", key=f"thumb_up_{fb_key}"):
+                            save_feedback(1, "", full_txt[:500], st.session_state.get("user_name", "user"))
+                            st.toast("Thanks for your feedback!")
+                            st.rerun()
+                    with c2:
+                        if st.button("👎 Not Helpful", key=f"thumb_down_{fb_key}"):
+                            save_feedback(0, "", full_txt[:500], st.session_state.get("user_name", "user"))
+                            st.toast("Thanks! We'll improve.")
+                            st.rerun()
+                    with c3:
+                        rating = st.selectbox("Rate", ["⭐", "⭐⭐", "⭐⭐⭐", "⭐⭐⭐⭐", "⭐⭐⭐⭐⭐"], key=f"star_{fb_key}", label_visibility="collapsed")
+                        if st.button("Submit Rating", key=f"rate_{fb_key}"):
+                            stars = len(rating)
+                            save_feedback(stars, "", full_txt[:500], st.session_state.get("user_name", "user"))
+                            st.toast(f"Rated {stars} stars!")
+                            st.rerun()
 
             except Exception as e:
                 st.error(f"API Error: {e}")
@@ -849,183 +1014,364 @@ YAHOO_MAPPING = {
 # Page configuration
 # ── PRO APP BRANDING ──
 st.set_page_config(
-    page_title="AI Quant Analyst | Impulse Master",
-    page_icon="💰",
+    page_title="The Finance Engine",
+    page_icon="📈",
     layout="wide",
 )
 
 # --- 🚀 CLOUD DETECTION ---
 import os
 IS_CLOUD = os.environ.get("STREAMLIT_SERVER_PORT") is not None or "HOSTNAME" in os.environ
-# -------------------------
-# App theme and styling
+
+# --- 🚀 CLOUD DETECTION ---
+import os
+IS_CLOUD = os.environ.get("STREAMLIT_SERVER_PORT") is not None or "HOSTNAME" in os.environ
+
+# App theme and styling - Finance Engine Theme
 st.markdown("""
 <style>
-    .reportview-container {
-        background: #0e1117;
-        color: #ccd6f6;
-    }
-    .stChatMessage {
-        border-radius: 10px;
-        margin-bottom: 10px;
-    }
-    .stButton>button {
-        width: 100%;
-        border-radius: 5px;
-    }
+@import url('https://fonts.googleapis.com/css2?family=Syne:wght@600;700;800&family=DM+Sans:opsz,wght@9..40,300;9..40,400;9..40,500&display=swap');
+
+:root {
+    --bg:       #0d1117;
+    --card:     #161b22;
+    --border:   #30363d;
+    --gold:     #f0b429;
+    --text:     #f0f6fc;
+    --muted:    #8b949e;
+    --muted2:   #6e7681;
+    --ibg:      #0d1117;
+}
+
+/* ── FORCE ALL EXPANDERS TO DARK ── */
+[data-testid="stExpander"],
+streamlit-expander,
+div[aria-label="🔒 MT5 Broker Gate (Local Connection Settings)"],
+div:has(> div > div > div > div:contains("MT5 Broker Gate")) {
+    background: #161b22 !important;
+}
+
+div[data-testid="stExpander"] > div {
+    background: #161b22 !important;
+}
+
+div[data-testid="stExpanderContent"] {
+    background: #161b22 !important;
+    color: #f0f6fc !important;
+}
+
+/* ── Full page reset ── */
+html, body, .stApp { 
+    background: var(--bg) !important; 
+    font-family: 'DM Sans', sans-serif;
+    color: var(--text) !important;
+}
+
+/* Main content background */
+div[data-testid="stMain"] {
+    background: var(--bg) !important;
+}
+
+/* Block container */
+div[data-testid="stMain"] > .block-container {
+    background: var(--bg) !important;
+}
+
+/* Hide default Streamlit elements */
+header[data-testid="stHeader"],
+.stToolbar, footer, #MainMenu, 
+[data-testid="stDecoration"],
+[data-testid="stStatusWidget"] { display: none !important; }
+
+/* ── Text colors - enforce everywhere ── */
+p, span, label, div, li, td, th {
+    color: var(--text) !important;
+}
+
+/* Secondary text */
+.muted, .stCaption, [data-testid="stCaption"] {
+    color: var(--muted) !important;
+}
+
+/* ── Block container styles ── */
+.block-container {
+    padding-top: 24px !important;
+    padding-bottom: 24px !important;
+    background: transparent !important;
+}
+
+/* ── Headers ── */
+h1, h2, h3, h4, h5, h6 {
+    font-family: 'Syne', sans-serif !important;
+    color: var(--text) !important;
+    font-weight: 700 !important;
+}
+
+/* Streamlit markdown headers */
+.stMarkdown h1, .stMarkdown h2, .stMarkdown h3 {
+    color: var(--text) !important;
+}
+
+/* ── Buttons ── */
+div[data-testid="stButton"] > button {
+    width: 100%;
+    background: linear-gradient(135deg,#f0b429 0%,#d99a0f 100%) !important;
+    border: none !important;
+    border-radius: 8px !important;
+    padding: 12px 20px !important;
+    font-family: 'Syne', sans-serif !important;
+    font-size: 14px !important;
+    font-weight: 600 !important;
+    color: #0d1117 !important;
+}
+
+div[data-testid="stButton"] > button:hover {
+    background: linear-gradient(135deg,#f0b429 0%,#f5c029 100%) !important;
+}
+
+/* ── Text inputs ── */
+div[data-testid="stTextInput"] input,
+input[class*="stTextInput"],
+.stTextInput input {
+    background: #0d1117 !important;
+    border: 1px solid #30363d !important;
+    border-radius: 8px !important;
+    padding: 12px 14px !important;
+    font-family: 'DM Sans', sans-serif !important;
+    font-size: 14px !important;
+    color: #f0f6fc !important;
+}
+
+div[data-testid="stTextInput"] input::placeholder,
+input[class*="stTextInput"]::placeholder {
+    color: #6e7681 !important;
+}
+
+/* ── Select boxes ── */
+div[data-testid="stSelectbox"] > div > div,
+div[class*="stSelectbox"] > div > div,
+.stSelectbox div[class*="Select"] {
+    background: #0d1117 !important;
+    border: 1px solid #30363d !important;
+    border-radius: 8px !important;
+    color: #f0f6fc !important;
+}
+
+div[data-testid="stSelectbox"] div[class*="Select"],
+.stSelectbox div[class*="Select"] {
+    color: #f0f6fc !important;
+}
+
+/* ── Number inputs ── */
+div[data-testid="stNumberInput"] input,
+input[class*="stNumberInput"],
+.stNumberInput input {
+    background: #0d1117 !important;
+    border: 1px solid #30363d !important;
+    color: #f0f6fc !important;
+}
+
+/* ── Input container (the wrapper around input) ── */
+div[data-testid="stTextInput"] > div > div,
+div[data-testid="stNumberInput"] > div,
+div[data-testid="stSelectbox"] > div,
+div[class*="TextInput"] > div,
+div[class*="NumberInput"] > div,
+div[class*="Selectbox"] > div {
+    background: #0d1117 !important;
+}
+
+/* ── Toggle/Checkbox ── */
+div[data-testid="stToggle"] label {
+    color: var(--text) !important;
+}
+
+/* ── All container text enforcement ── */
+.stApp *,
+div[class*="stMarkdown"] p,
+div[class*="stText"],
+div[class*="stLabel"] {
+    color: var(--text) !important;
+}
+
+/* ── Sidebar styling ── */
+section[data-testid="stSidebar"] {
+    background: var(--card) !important;
+    border-right: 1px solid var(--border) !important;
+}
+
+section[data-testid="stSidebar"] * {
+    color: var(--text) !important;
+}
+
+section[data-testid="stSidebar"] .stMarkdown,
+section[data-testid="stSidebar"] p,
+section[data-testid="stSidebar"] label {
+    color: var(--text) !important;
+}
+
+/* ── Metrics ── */
+[data-testid="stMetric"] {
+    background: var(--card) !important;
+    border: 1px solid var(--border) !important;
+    border-radius: 8px !important;
+    padding: 16px !important;
+}
+
+[data-testid="stMetric"] * {
+    color: var(--text) !important;
+}
+
+/* ── Chat messages ── */
+.stChatMessage {
+    background: var(--card) !important;
+    border-radius: 8px !important;
+}
+
+.stChatMessage * {
+    color: var(--text) !important;
+}
+
+/* ── Expanders ── */
+streamlit-expander {
+    background: var(--card) !important;
+    border: 1px solid var(--border) !important;
+    border-radius: 8px !important;
+}
+
+streamlit-expander > div {
+    background: var(--card) !important;
+}
+
+div[data-testid="stExpanderContent"] {
+    background: var(--card) !important;
+    border-top: 1px solid var(--border) !important;
+}
+
+/* Fix for expander content - more aggressive */
+div[aria-expanded="true"] + div,
+div[data-testid="stExpanderContent"] > div,
+div[data-testid="stExpanderContent"] > section {
+    background: var(--card) !important;
+}
+
+/* Expander inner container */
+section[data-testid="stExpander"] > div:first-child,
+section[data-testid="stExpander"] > div:last-child {
+    background: var(--card) !important;
+}
+
+/* ALL elements inside expander get dark background */
+div[data-testid="stExpanderContent"] * {
+    background: #161b22 !important;
+    color: #f0f6fc !important;
+}
+
+/* Columns inside expander */
+div[data-testid="stExpanderContent"] > div > div[class*="stColumn"],
+div[data-testid="stExpanderContent"] div[data-testid="stHorizontalBlock"] {
+    background: var(--card) !important;
+}
+
+/* ── Data frames / tables ── */
+[data-testid="stDataFrame"],
+[data-testid="stAgGrid"] {
+    border: 1px solid var(--border) !important;
+}
+
+[data-testid="stDataFrame"] *,
+[data-testid="stAgGrid"] * {
+    color: var(--text) !important;
+}
+
+/* ── Tabs ── */
+div[data-testid="stTabs"] button {
+    font-family: 'Syne', sans-serif !important;
+    font-weight: 600 !important;
+    color: var(--text) !important;
+}
+
+div[data-testid="stTabs"] button[aria-selected="true"] {
+    color: var(--gold) !important;
+}
+
+/* ── Radio buttons ── */
+div[data-testid="stRadio"] label {
+    color: var(--text) !important;
+}
+
+/* ── Checkboxes ── */
+div[data-testid="stCheckbox"] label {
+    color: var(--text) !important;
+}
+
+/* ── Sliders ── */
+div[data-testid="stSlider"] label {
+    color: var(--text) !important;
+}
+
+/* ── Form containers ── */
+div[data-testid="stForm"] {
+    background: transparent !important;
+    border: none !important;
+}
+
+/* ── Tooltips ── */
+div[data-testid="stTooltipIcon"] {
+    color: var(--muted) !important;
+}
+
+/* ── Error/Warning/Success messages ── */
+.stAlert {
+    background: var(--card) !important;
+    border-radius: 8px !important;
+    color: var(--text) !important;
+}
+
+/* ── Scrollbars ── */
+::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+}
+::-webkit-scrollbar-track {
+    background: var(--bg);
+}
+::-webkit-scrollbar-thumb {
+    background: var(--border);
+    border-radius: 4px;
+}
 </style>
 """, unsafe_allow_html=True)
 
-# Password Protection
-# Password Protection & Multi-User Auth
-# --- 🛡️ AUTHENTICATION SYSTEM (Refactored) ---
-def log_access(username):
-    """Log successful login attempt with source information."""
-    master_audit_log("LOGIN", f"Successfully logged into station: {username}")
+# Authentication is now handled by login_page module
+check_auth()
 
-def handle_login_request():
-    """Top-level handler for login authentication logic."""
-    import os
-    import json
-    
-    entered_username = st.session_state.username_input
-    entered_password = st.session_state.password_input
-    
-    # Resolve user database: First check Environment Variable (Safe for Public Repo), then fall back to local file
-    user_db = None
-    user_db_env = os.environ.get("USER_DB_JSON")
-    
-    if user_db_env:
-        try:
-            user_db = json.loads(user_db_env)
-            users = user_db.get("users", [])
-        except Exception as e:
-            st.error(f"Error parsing USER_DB_JSON environment variable: {e}")
-            return
-    
-    if not user_db:
-        try:
-            if os.path.exists("users.json"):
-                with open("users.json", "r") as f:
-                    user_db = json.load(f)
-                    users = user_db.get("users", [])
-            else:
-                st.error("User database not found (Check USER_DB_JSON or users.json)")
-                return
-        except Exception as e:
-            st.error(f"Error loading local user database: {e}")
-            return
-        
-    # Validate credentials
-    found_user = next((u for u in users if u["username"] == entered_username and u["password"] == entered_password), None)
-    
-    if found_user:
-        st.session_state.authenticated = True
-        st.session_state.user_name = found_user.get("name", entered_username)
-        st.session_state.username = entered_username
-        log_access(entered_username)
-        st.toast(f"Welcome back, {st.session_state.user_name}!")
-    else:
-        st.session_state.login_error = True
+# ── Main App Header Banner ──
+st.markdown("""
+<style>
+.tfe-logo-row {
+    display: flex; align-items: center; gap: 10px;
+    margin-bottom: 20px; padding-bottom: 20px;
+    border-bottom: 1px solid rgba(255,255,255,0.07);
+}
+.tfe-logo-icon {
+    width: 40px; height: 40px; border-radius: 10px; flex-shrink: 0;
+    background: linear-gradient(135deg,rgba(245,171,53,0.14),rgba(245,171,53,0.03));
+    border: 1px solid rgba(245,171,53,0.2);
+    display: flex; align-items: center; justify-content: center; font-size: 19px;
+}
+.tfe-logo-name {
+    font-family: 'Syne',sans-serif; font-size: 20px; font-weight: 700;
+    color: #edf0f6; letter-spacing: -0.2px;
+}
+.tfe-logo-name span { color: #f0b429; }
+</style>
 
-def handle_logout_request():
-    st.session_state.authenticated = False
-    st.session_state.login_error = False
-    st.session_state.username_input = ""
-    st.session_state.password_input = ""
-    st.rerun()
-
-def check_password():
-    """Check if the user has entered a valid username and password."""
-    if "authenticated" not in st.session_state:
-        st.session_state.authenticated = False
-    
-    if not st.session_state.authenticated:
-        st.markdown("""
-        <style>
-        .login-container {
-            max-width: 400px;
-            margin: 80px auto;
-            padding: 40px;
-            border-radius: 12px;
-            background: #161b22;
-            border: 1px solid #30363d;
-            box-shadow: 0 4px 12px rgba(0,0,0,0.5);
-        }
-        .login-title {
-            text-align: center;
-            color: #58a6ff;
-            margin-bottom: 30px;
-            font-family: 'Inter', sans-serif;
-        }
-        </style>
-        """, unsafe_allow_html=True)
-        
-        col1, col2, col3 = st.columns([1, 1, 1])
-        with col2:
-            st.markdown('<div class="login-container">', unsafe_allow_html=True)
-            st.markdown('<h2 class="login-title">🏛️ Quant Station Login</h2>', unsafe_allow_html=True)
-            
-            st.text_input(
-                "Username",
-                key="username_input",
-                placeholder="Enter username"
-            )
-            
-            st.text_input(
-                "Password",
-                type="password",
-                key="password_input",
-                placeholder="Enter password"
-            )
-            
-            if st.button("🚀 Enter Station", width="stretch", on_click=handle_login_request):
-                pass
-
-            if st.session_state.get("login_error", False):
-                st.error("❌ Invalid Username or Password")
-            st.markdown('</div>', unsafe_allow_html=True)
-        return False
-    
-    # Sidebar Logout & User Info
-    with st.sidebar:
-        st.markdown(f"#### 👤 User: {st.session_state.get('user_name', 'Unknown')}")
-        if st.button("🚪 Logout Session", width="stretch"):
-            handle_logout_request()
-        st.markdown("---")
-        
-        # EA Files Download
-        st.subheader("📦 Download EA Files")
-        st.caption("Download the MA Impulse Logger EA for generating datasets")
-        
-        import zipfile
-        import os
-        
-        if st.button("📥 Download EA Package (ZIP)", key="ea_zip_btn"):
-            zip_buffer = io.BytesIO()
-            base_dir = os.path.dirname(os.path.abspath(__file__))
-            
-            with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
-                for file_name in ["MA_Impulse_Logger.ex5", "MA_Impulse_Logger.mq5"]:
-                    path = os.path.join(base_dir, file_name)
-                    if os.path.exists(path):
-                        zip_file.write(path, file_name)
-            
-            zip_buffer.seek(0)
-            st.download_button(
-                label="✅ Click to Download",
-                data=zip_buffer,
-                file_name="MA_Impulse_Logger_Package.zip",
-                mime="application/zip",
-                key="download_ea_zip"
-            )
-        st.markdown("---")
-    
-    return True
-
-# Check authentication before showing app
-if not check_password():
-    st.stop()
+<div class="tfe-logo-row">
+    <div class="tfe-logo-icon">📈</div>
+    <div class="tfe-logo-name">The Finance <span>Engine</span></div>
+</div>
+""", unsafe_allow_html=True)
 
 # Sidebar configuration
 with st.sidebar:
@@ -1167,182 +1513,87 @@ with st.sidebar:
     mt5_url = st.session_state.get("mt5_url", "http://localhost:5000")
     mt5_token = get_secret("MT5_API_TOKEN", "impulse_secure_2026")
 
-    # 🚀 --- AUTOPILOT CONTROL CENTER ---
-    st.markdown("---")
-    st.subheader("🚀 PROMPT AUTOPILOT (THREAD-BASED)")
-    st.caption("Background thread runs every 5 min - independent of browser refresh!")
-
-    # Autopilot interval control
-    interval_minutes = st.session_state.get('autopilot_interval', 300) / 60
-    new_interval = st.selectbox(
-        "⏱️ Execution Interval",
-        options=[1, 2, 3, 5, 10, 15, 20, 30],
-        index=[1, 2, 3, 4, 5, 6, 7, 8].index(5) if 5 in [1, 2, 3, 5, 10, 15, 20, 30] else 3,
-        format_func=lambda x: f"Every {x} minute{'s' if x > 1 else ''}",
-        help="How often the autopilot should run"
-    )
-    st.session_state.autopilot_interval = new_interval * 60
-
-    # Start/Stop buttons
-    col_start, col_stop = st.columns(2)
+    # --- AUTOPILOT & AUTO-SYNC (HIDDEN) ---
+    # The autopilot and auto-sync features are hidden for now but code is kept for future use
+    """
+    """
+    # A
+    """
+    """
     
-    with col_start:
-        if st.button("🚀 Start Autopilot", type="primary", use_container_width=True,
-                    disabled=st.session_state.get('autopilot_thread') is not None):
-            start_autopilot_thread(
-                mt5_url, mt5_token, hf_repo, hf_token,
-                model_choice, api_key_to_use, provider_choice, base_url
-            )
-            st.rerun()
+    # --- 🌍 GLOBAL MARKET VAULT (HIDDEN) ---
+    # st.markdown("---")
+    # st.subheader("🌍 Global Market Vault")
+    # st.caption("Pull stocks/crypto from Yahoo Finance and archive to Cloud Hub.")
+
+    # yf_symbol = st.text_input("Ticker Symbol", placeholder="e.g. NVDA, BTC-USD, TSLA")
     
-    with col_stop:
-        if st.button("⏹️ Stop Autopilot", type="secondary", use_container_width=True,
-                    disabled=st.session_state.get('autopilot_thread') is None):
-            stop_autopilot_thread()
-            st.rerun()
+    # col_per, col_int = st.columns(2)
+    # with col_per:
+    #     yf_period = st.selectbox("History", ["1mo", "3mo", "1y", "5y", "max"], index=4)
+    # with col_int:
+    #     yf_interval = st.selectbox("Interval", ["1h", "1d", "1wk"], index=1)
 
-    # Status display
-    if st.session_state.get('autopilot_thread') is not None:
-        st.success("✅ Background thread is running")
-        
-        # Countdown timer
-        next_run = st.session_state.get('next_auto_run_time')
-        if next_run:
-            import time as time_module
-            remaining = max(0, next_run - time_module.time())
-            minutes = int(remaining // 60)
-            seconds = int(remaining % 60)
-            st.info(f"⏰ Next execution in: **{minutes}m {seconds}s**")
-        
-        if st.session_state.last_auto_run:
-            import time as time_module
-            st.caption(f"Last Run: {time_module.strftime('%H:%M:%S', st.session_state.last_auto_run)}")
-    else:
-        st.warning("⏹️ Autopilot is stopped")
-
-    # Lot size control
-    st.session_state.autopilot_lot = st.number_input(
-        "Auto-Pilot Fixed Lot",
-        value=st.session_state.autopilot_lot,
-        min_value=0.01, 
-        step=0.01
-    )
-
-    # Statistics
-    col_stat1, col_stat2, col_stat3 = st.columns(3)
-    with col_stat1:
-        st.metric("✅ Success", st.session_state.get('autopilot_success_count', 0))
-    with col_stat2:
-        st.metric("❌ Errors", st.session_state.get('autopilot_error_count', 0))
-    with col_stat3:
-        total = st.session_state.get('autopilot_success_count', 0) + st.session_state.get('autopilot_error_count', 0)
-        success = st.session_state.get('autopilot_success_count', 0)
-        rate = (success / total * 100) if total > 0 else 0
-        st.metric("📊 Success Rate", f"{rate:.1f}%")
-
-    if st.button("🧹 Clear Auto-Logs & Stats"):
-        st.session_state.autopilot_logs = []
-        st.session_state.autopilot_error_count = 0
-        st.session_state.autopilot_success_count = 0
-        st.rerun()
-
-    # Simple freshness display (Optional but nice for sidebar)
-    st.markdown("---")
-    st.subheader("⚡ Auto-Sync Mode")
-    auto_sync_on = st.toggle("Enable Auto-Sync 📡", value=st.session_state.get("auto_sync_on", False))
-    st.session_state.auto_sync_on = auto_sync_on
-
-    if auto_sync_on:
-        sync_interval = st.selectbox("Frequency ⏱️", [1, 4, 5, 10, 15, 30, 60], index=1, format_func=lambda x: f"Every {x} min")
-        refresh_count = st_autorefresh(interval=sync_interval * 60 * 1000, key="sync_counter")
-        
-        if refresh_count > 0:
-            current_sym = st.session_state.get("current_symbol_view", "XAUUSD")
-            if hf_repo and hf_token and mt5_url:
-                from data_sync import sync_symbol
-                try:
-                    updated_df, stats = sync_symbol(hf_repo, current_sym, hf_token, mt5_url, mt5_token)
-                    st.session_state[f"df_{current_sym}"] = updated_df
-                    st.toast(f"🔄 Auto-Synced {current_sym} ({stats.get('new_rows', 0)} new candles)")
-                except Exception as e:
-                    st.toast(f"🚨 Auto-Sync failed for {current_sym}")
-
-    # Note: Autopilot now runs in a background thread (see control center above)
-    # No browser-dependent refresh needed!
-
-    # --- 🌍 GLOBAL MARKET VAULT ---
-    st.markdown("---")
-    st.subheader("🌍 Global Market Vault")
-    st.caption("Pull stocks/crypto from Yahoo Finance and archive to Cloud Hub.")
-
-    yf_symbol = st.text_input("Ticker Symbol", placeholder="e.g. NVDA, BTC-USD, TSLA")
-    
-    col_per, col_int = st.columns(2)
-    with col_per:
-        yf_period = st.selectbox("History", ["1mo", "3mo", "1y", "5y", "max"], index=4)
-    with col_int:
-        yf_interval = st.selectbox("Interval", ["1h", "1d", "1wk"], index=1)
-
-    if st.button("📥 Fetch & Archive to Cloud", width="stretch"):
-        if not yf_symbol:
-            st.warning("Please enter a ticker symbol.")
-        elif not hf_repo or not hf_token:
-            st.error("Missing Hugging Face credentials in secrets.toml")
-        else:
-            from data_sync import sync_yahoo_symbol
-            with st.spinner(f"Fetching {yf_symbol} from Global Markets..."):
-                try:
-                    df_yf, stats_yf = sync_yahoo_symbol(hf_repo, yf_symbol, hf_token, yf_period, yf_interval)
-                    st.success(f"✅ {yf_symbol} Vaulted: {stats_yf['total_rows']:,} rows in Cloud")
-                    st.session_state.df = df_yf
-                    st.session_state.file_name = stats_yf["filename"]
-                    st.toast(f"🏆 {yf_symbol} added to your Cloud Warehouse!")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"❌ Global Fetch Failed: {e}")
+    # if st.button("📥 Fetch & Archive to Cloud", width="stretch"):
+    #     if not yf_symbol:
+    #         st.warning("Please enter a ticker symbol.")
+    #     elif not hf_repo or not hf_token:
+    #         st.error("Missing Hugging Face credentials in secrets.toml")
+    #     else:
+    #         from data_sync import sync_yahoo_symbol
+    #         with st.spinner(f"Fetching {yf_symbol} from Global Markets..."):
+    #             try:
+    #                 df_yf, stats_yf = sync_yahoo_symbol(hf_repo, yf_symbol, hf_token, yf_period, yf_interval)
+    #                 st.success(f"✅ {yf_symbol} Vaulted: {stats_yf['total_rows']:,} rows in Cloud")
+    #                 st.session_state.df = df_yf
+    #                 st.session_state.file_name = stats_yf["filename"]
+    #                 st.toast(f"🏆 {yf_symbol} added to your Cloud Warehouse!")
+    #                 st.rerun()
+    #             except Exception as e:
+    #                 st.error(f"❌ Global Fetch Failed: {e}")
 
     # --- 🌐 GLOBAL WEB INTEL SEARCH ---
-    st.markdown("---")
-    st.subheader("🌐 Global Web Intel")
-    st.caption("AI-powered research for macro news, sentiment, and geopolitics.")
+    # st.markdown("---")
+    # st.subheader("🌐 Global Web Intel")
+    # st.caption("AI-powered research for macro news, sentiment, and geopolitics.")
 
-    search_query = st.text_input("Research Topic", placeholder="e.g. FOMC meeting interest rates, XAUUSD sentiment")
+    # search_query = st.text_input("Research Topic", placeholder="e.g. FOMC meeting interest rates, XAUUSD sentiment")
     
-    col_s1, col_s2 = st.columns(2)
-    with col_s1:
-        max_res = st.slider("Max Results", 3, 10, 5)
-    with col_s2:
-        search_type = st.radio("Focus", ["Market News", "General Search"], index=0, horizontal=True)
+    # col_s1, col_s2 = st.columns(2)
+    # with col_s1:
+    #     max_res = st.slider("Max Results", 3, 10, 5)
+    # with col_s2:
+    #     search_type = st.radio("Focus", ["Market News", "General Search"], index=0, horizontal=True)
 
-    if st.button("🔍 Deep Intel Search", width="stretch"):
-        if not search_query:
-            st.warning("Please enter a research topic.")
-        else:
-            from web_search import run_web_search, get_market_news, analyze_sentiment
-            with st.spinner(f"🔍 AI is researching the web for '{search_query}'..."):
-                try:
-                    if search_type == "Market News":
-                        res = get_market_news(search_query, max_results=max_res)
-                    else:
-                        res = run_web_search(search_query, max_results=max_res)
+    # if st.button("🔍 Deep Intel Search", width="stretch"):
+    #     if not search_query:
+    #         st.warning("Please enter a research topic.")
+    #     else:
+    #         from web_search import run_web_search, get_market_news, analyze_sentiment
+    #         with st.spinner(f"🔍 AI is researching the web for '{search_query}'..."):
+    #             try:
+    #                 if search_type == "Market News":
+    #                     res = get_market_news(search_query, max_results=max_res)
+    #                 else:
+    #                     res = run_web_search(search_query, max_results=max_res)
                     
-                    if not res:
-                        st.warning("No results found. Try a different query.")
-                    else:
-                        sentiment = analyze_sentiment(res)
-                        st.info(f"🧠 **AI Sentiment Estimate:** {sentiment}")
+    #                 if not res:
+    #                     st.warning("No results found. Try a different query.")
+    #                 else:
+    #                     sentiment = analyze_sentiment(res)
+    #                     st.info(f"🧠 **AI Sentiment Estimate:** {sentiment}")
                         
-                        st.markdown("### 📰 Latest Findings:")
-                        for r in res:
-                            with st.expander(f"📌 {r['title']}"):
-                                st.write(f"**Source:** {r['href']}")
-                                st.write(f"{r['body']}")
-                                st.markdown(f"[Read full article]({r['href']})")
-                        st.toast("✅ Web Research Completed!")
-                except Exception as e:
-                    st.error(f"❌ Search Error: {e}")
+    #                     st.markdown("### 📰 Latest Findings:")
+    #                     for r in res:
+    #                         with st.expander(f"📌 {r['title']}"):
+    #                             st.write(f"**Source:** {r['href']}")
+    #                             st.write(f"{r['body']}")
+    #                             st.markdown(f"[Read full article]({r['href']})")
+    #                     st.toast("✅ Web Research Completed!")
+    #             except Exception as e:
+    #                 st.error(f"❌ Search Error: {e}")
 
-# Arrow-safe display helper (fixes PyArrow serialization errors)
+    # Arrow-safe display helper (fixes PyArrow serialization errors)
 def make_arrow_safe(df):
     """Convert DataFrame to Arrow-compatible types for Streamlit display."""
     if not isinstance(df, pd.DataFrame):
@@ -1621,53 +1872,87 @@ if "Historical" in view_mode:
     st.markdown("### 📥 Load Recent Market Data (7-Day 1M)")
     colA, colB, colC = st.columns([1.5, 2.5, 1])
     with colA:
+        # Get symbols from broker if connected, else use default
+        available_syms = st.session_state.get("available_symbols", ["XAUUSD", "EURUSD", "DXY", "GBPUSD", "BTCUSD", "US30", "NAS100"])
+        
+        # Show symbol count if available
+        sym_count = st.session_state.get("broker_symbol_count", len(available_syms))
+        st.caption(f"📊 {sym_count} symbols available")
+        
         symbol_choice = st.selectbox(
             "Select Symbol", 
-            ["XAUUSD", "EURUSD", "DXY"],
+            available_syms,
             label_visibility="collapsed"
         )
     with colB:
         if st.button(f"🚀 Fetch Last 7 Days ({symbol_choice})", width="stretch"):
             st.session_state.current_symbol_view = symbol_choice
             
-            from data_sync import YAHOO_MAPPING
-            target_yh = YAHOO_MAPPING.get(symbol_choice)
+            # Priority: Use MT5 if connected, otherwise Yahoo Finance
+            mt5_connected = st.session_state.get("mt5_connected", False)
+            mt5_url = st.session_state.get("mt5_url", "http://localhost:5000")
+            mt5_token = get_secret("MT5_API_TOKEN", "impulse_secure_2026")
             
-            if target_yh:
-                import yfinance as yf
-                with st.spinner(f"📡 Fetching live 1m data for {symbol_choice} from Yahoo Finance..."):
+            data_source = ""
+            
+            if mt5_connected:
+                # Fetch from MT5 (supports ALL broker symbols!)
+                from data_sync import pull_mt5_latest
+                with st.spinner(f"📡 Fetching 7-day data for {symbol_choice} from your broker..."):
                     try:
-                        ticker = yf.Ticker(target_yh)
-                        # Fetch the last 7 days of 1-minute data
-                        new_df = ticker.history(period="7d", interval="1m")
-                        
+                        new_df = pull_mt5_latest(mt5_url, symbol_choice, "M1", 10080, mt5_token)  # 7 days x 24h x 60min = 10080
                         if not new_df.empty:
-                            new_df = new_df.reset_index()
-                            time_col = next(
-                                (c for c in new_df.columns if c.lower() in ("datetime", "date")),
-                                new_df.columns[0]
-                            )
-                            new_df = new_df.rename(columns={
-                                time_col:       'time',
-                                'Open':         'open',
-                                'High':         'high',
-                                'Low':          'low',
-                                'Close':        'close',
-                                'Volume':       'tick_volume',
-                            })
-                            new_df['time'] = pd.to_datetime(new_df['time'], utc=True)
-                            new_df.columns = [c.lower() for c in new_df.columns]
-                            
                             st.session_state.df = new_df
                             st.session_state[f"df_{symbol_choice}"] = new_df
-                            st.session_state.file_name = f"YahooFinance_{symbol_choice}_7D"
-                            st.success(f"✅ Successfully loaded **{len(new_df):,}** rows directly into UI memory (Zero OOM risk!).")
+                            st.session_state.file_name = f"MT5_{symbol_choice}_7D"
+                            data_source = "MT5 Broker"
+                            st.success(f"✅ Loaded **{len(new_df):,}** rows from {symbol_choice} (Zero OOM risk!).")
                         else:
-                            st.error(f"❌ Yahoo Finance returned 0 rows for {symbol_choice}. Markets might be closed.")
+                            st.error(f"❌ MT5 returned empty data for {symbol_choice}.")
                     except Exception as e:
-                        st.error(f"⚠️ Failed to fetch data from Yahoo Finance: {e}")
-            else:
-                st.error(f"⚠️ No Yahoo Finance mapping defined for {symbol_choice} (Check data_sync.py).")
+                        st.warning(f"⚠️ MT5 fetch failed: {e}. Trying Yahoo Finance...")
+                        mt5_connected = False  # Fallback to Yahoo
+            
+            if not mt5_connected or data_source == "":
+                # Fallback: Yahoo Finance (limited mapping)
+                from data_sync import YAHOO_MAPPING
+                target_yh = YAHOO_MAPPING.get(symbol_choice)
+                
+                if target_yh:
+                    import yfinance as yf
+                    with st.spinner(f"📡 Fetching 7-day data for {symbol_choice} from Yahoo Finance..."):
+                        try:
+                            ticker = yf.Ticker(target_yh)
+                            new_df = ticker.history(period="7d", interval="1m")
+                            
+                            if not new_df.empty:
+                                new_df = new_df.reset_index()
+                                time_col = next(
+                                    (c for c in new_df.columns if c.lower() in ("datetime", "date")),
+                                    new_df.columns[0]
+                                )
+                                new_df = new_df.rename(columns={
+                                    time_col:       'time',
+                                    'Open':         'open',
+                                    'High':         'high',
+                                    'Low':          'low',
+                                    'Close':        'close',
+                                    'Volume':       'tick_volume',
+                                })
+                                new_df['time'] = pd.to_datetime(new_df['time'], utc=True)
+                                new_df.columns = [c.lower() for c in new_df.columns]
+                                
+                                st.session_state.df = new_df
+                                st.session_state[f"df_{symbol_choice}"] = new_df
+                                st.session_state.file_name = f"YahooFinance_{symbol_choice}_7D"
+                                data_source = "Yahoo Finance"
+                                st.success(f"✅ Loaded **{len(new_df):,}** rows from Yahoo Finance (Zero OOM risk!).")
+                            else:
+                                st.error(f"❌ Yahoo Finance returned 0 rows for {symbol_choice}. Markets might be closed.")
+                        except Exception as e:
+                            st.error(f"⚠️ Failed to fetch data from Yahoo Finance: {e}")
+                else:
+                    st.error(f"⚠️ No data source available for {symbol_choice}. Connect to MT5 broker for full symbol support!")
             
             st.session_state.messages = []
             st.rerun()
@@ -1694,10 +1979,9 @@ if "Historical" in view_mode:
             if "messages" not in st.session_state: st.session_state.messages = []
             for m in st.session_state.messages:
                 with st.chat_message(m["role"]):
-                    st.markdown(m["content"])
-                    if "code" in m:
-                        with st.expander("Show Code"): st.code(m["code"])
-                        execute_generated_code(m["code"], df)
+                    display_content = filter_code_from_message(m.get("content", ""))
+                    st.markdown(display_content)
+                    # Code display removed - no longer showing code in dashboard
             
             if prompt := st.chat_input("Analyze the archive...", key="hist_chat"):
                 process_ai_query(prompt, df, model_choice, api_key_to_use, provider_choice, history_key="messages", base_url=base_url)
@@ -1739,7 +2023,25 @@ elif "Live" in view_mode:
                 if res["reachable"] and res["mt5_initialized"]:
                     st.session_state.mt5_connected = True
                     st.session_state.mt5_url = mt5_url_in
-                    st.success("✅ Bridge Established! Terminal Unlocked.")
+                    
+                    # Fetch all available symbols from broker
+                    try:
+                        import requests
+                        symbols_url = f"{mt5_url_in}/symbols/all"
+                        headers = {"X-MT5-Token": mt5_tok_in}
+                        symbols_res = requests.get(symbols_url, headers=headers, timeout=10)
+                        if symbols_res.status_code == 200:
+                            data = symbols_res.json()
+                            all_symbols = [s["name"] for s in data.get("symbols", []) if s.get("visible", False)]
+                            st.session_state.available_symbols = sorted(all_symbols)
+                            st.session_state.broker_symbol_count = len(all_symbols)
+                            st.success(f"✅ Bridge Established! Terminal Unlocked. ({len(all_symbols)} symbols loaded)")
+                        else:
+                            st.success("✅ Bridge Established! Terminal Unlocked.")
+                    except Exception as e:
+                        print(f"[Symbols] Could not fetch symbols: {e}")
+                        st.success("✅ Bridge Established! Terminal Unlocked.")
+                    
                     st.rerun()
                 else:
                     st.session_state.mt5_connected = False
@@ -1772,7 +2074,11 @@ elif "Live" in view_mode:
 
             # ── CHART & FEED CONTROLS ──────────────────────────────────────────
             st_col1, st_col2, st_col3, st_col4 = st.columns([1.5, 1, 1.5, 1.5])
-            with st_col1: l_sym = st.selectbox("Symbol", ["XAUUSD", "EURUSD", "DXY"], key="l_sym")
+            with st_col1:
+                available_syms_live = st.session_state.get("available_symbols", ["XAUUSD", "EURUSD", "DXY"])
+                sym_count_live = st.session_state.get("broker_symbol_count", len(available_syms_live))
+                st.caption(f"📊 {sym_count_live} symbols available")
+                l_sym = st.selectbox("Symbol", available_syms_live, key="l_sym")
             with st_col2: l_tf = st.selectbox("TF", ["1m", "5m", "15m", "1h"], key="l_tf")
             with st_col3: l_count = st.number_input("Lookback Bars", value=500, min_value=100, max_value=5000, step=100, key="l_count")
             with st_col4: 
@@ -1899,7 +2205,8 @@ elif "Live" in view_mode:
                 # Render messages with unique IDs based on index
                 for i, m in enumerate(st.session_state.messages_live):
                     with st.chat_message(m["role"]):
-                        st.markdown(m["content"])
+                        display_content = filter_code_from_message(m.get("content", ""))
+                        st.markdown(display_content)
                         if m.get("detected_setup"): 
                             render_trade_card(m["detected_setup"], m_url, m_tok, card_id=f"msg_{i}")
                         if m.get("detected_action"): 
@@ -1942,47 +2249,3 @@ elif "Live" in view_mode:
 else:
     st.info("👋 Welcome! Please select a Mode above to begin.")
     st.image("https://developer.nvidia.com/sites/default/files/akamai/NVIDIA_NIM_Icon.png", width=100)
-
-# --- 📊 AUTOPILOT DASHBOARD ---
-if st.session_state.get('autopilot_thread') is not None or st.session_state.autopilot_logs:
-    # Auto-refresh UI every 2 seconds when autopilot is running
-    # This is needed so the countdown timer and logs update visibly
-    if st.session_state.get('autopilot_thread') is not None:
-        st_autorefresh(interval=2000, key="autopilot_ui_refresh")
-    
-    st.markdown("---")
-    st.subheader("📊 Automation Log & Activity")
-
-    # Status bar
-    status_col1, status_col2, status_col3 = st.columns(3)
-    with status_col1:
-        if st.session_state.get('autopilot_thread') is not None:
-            st.success("🟢 Thread Active")
-        else:
-            st.info("⏹️ Thread Stopped")
-    with status_col2:
-        next_run = st.session_state.get('next_auto_run_time')
-        if next_run:
-            import time as time_module
-            remaining = max(0, next_run - time_module.time())
-            minutes = int(remaining // 60)
-            seconds = int(remaining % 60)
-            st.info(f"⏰ Next: {minutes}m {seconds}s")
-        else:
-            st.caption("Not scheduled")
-    with status_col3:
-        total_runs = st.session_state.get('autopilot_success_count', 0) + st.session_state.get('autopilot_error_count', 0)
-        st.metric("📝 Total Runs", total_runs)
-
-    # Log container
-    log_container = st.container(height=300)
-    with log_container:
-        if not st.session_state.autopilot_logs:
-            st.info("Waiting for first execution...")
-        else:
-            # Show last 50 logs to prevent overflow
-            display_logs = st.session_state.autopilot_logs[:50]
-            for log in display_logs:
-                st.write(log)
-            if len(st.session_state.autopilot_logs) > 50:
-                st.caption(f"... and {len(st.session_state.autopilot_logs) - 50} more older logs")

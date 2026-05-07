@@ -222,21 +222,31 @@ class MT5DataProvider:
             return []
 
     def get_symbol_info(self, symbol):
-        """Get detailed symbol information"""
+        """Get detailed symbol information including live tick data"""
         if not self.initialized:
             return None
         try:
             info = mt5.symbol_info(symbol)
             if info is None:
                 return None
-            return {
+            
+            # Get live tick data (ask/bid)
+            tick = mt5.symbol_info_tick(symbol)
+            
+            result = {
                 'name': info.name,
                 'description': info.description,
                 'point': info.point,
                 'digits': info.digits,
                 'trade_contract_size': info.trade_contract_size,
-                'visible': info.visible
+                'visible': info.visible,
+                'ask': tick.ask if tick else None,
+                'bid': tick.bid if tick else None,
+                'last': tick.last if tick else None,
+                'volume': tick.volume if tick else None,
+                'time': datetime.fromtimestamp(tick.time).strftime('%Y-%m-%d %H:%M:%S') if tick and tick.time else None
             }
+            return result
         except Exception as e:
             print(f"Symbol info error: {e}")
             return None
@@ -395,6 +405,19 @@ def symbol_info(symbol: str, token: Annotated[str, Depends(verify_token)]):
     if info is None:
         raise HTTPException(status_code=404, detail=f"Symbol {symbol} not found")
     return info
+
+@app.get("/symbols/all")
+def get_all_symbols(token: Annotated[str, Depends(verify_token)]):
+    """Get all available symbols from broker"""
+    if not provider.initialized:
+        raise HTTPException(status_code=400, detail="MT5 not initialized")
+    all_symbols = mt5.symbols_get()
+    if not all_symbols:
+        return {"count": 0, "symbols": []}
+    return {
+        "count": len(all_symbols),
+        "symbols": [{"name": s.name, "visible": s.visible, "description": s.description} for s in all_symbols]
+    }
 
 @app.post("/data/fetch")
 def fetch_data(req: FetchDataRequest, token: Annotated[str, Depends(verify_token)]):
@@ -604,40 +627,64 @@ def place_order(req: PlaceOrderRequest, token: Annotated[str, Depends(verify_tok
 
     price = round(price, digits)
 
-    # Validate SL/TP
-    if not is_pending:
-        if req.sl is not None:
-            sl = round(req.sl, digits)
-            if req.action == "BUY":
-                if sl >= price:
-                    sl = round(price - abs(price - sl) - min_stop_price, digits)
-                if (price - sl) < min_stop_price:
-                    sl = round(price - min_stop_price, digits)
-            else:  # SELL
-                if sl <= price:
-                    sl = round(price + abs(price - sl) + min_stop_price, digits)
-                if (sl - price) < min_stop_price:
-                    sl = round(price + min_stop_price, digits)
-        else:
-            sl = None
+    # --- 🛡️ SMART PRICE VALIDATION & FIXING ---
+    # Metal/Broker Stop Levels (Minimum distance from current price)
+    min_dist = max(symbol_info.trade_stops_level, 10) * point 
+    
+    if is_pending:
+        # 🔄 AUTO-CLASSIFICATION (Handle price movement between setup and execution)
+        # If user asked for BUY_LIMIT but price is already ABOVE Entry + min_dist, it's a BUY_LIMIT.
+        # If price moved below Entry, it becomes a BUY_STOP or a BUY_MARKET.
+        
+        if req.action == "BUY_LIMIT":
+            if price >= tick.ask - min_dist: 
+                # Price is too close or already below current ask
+                # To be safe and ensure execution, we can either nudge it or convert to MARKET
+                print(f"⚠️ BUY_LIMIT {price} too close to Ask {tick.ask}. Adjusting...")
+                if price >= tick.ask:
+                    # Logic says it should be a BUY_STOP now, but if user wanted LIMIT,
+                    # they probably wanted to buy LOWER. 
+                    # If we convert to MARKET, we buy HIGHER than they wanted.
+                    # Best is to keep it as LIMIT but at a safe distance.
+                    price = round(tick.ask - min_dist, digits)
+        
+        elif req.action == "BUY_STOP":
+            if price <= tick.ask + min_dist:
+                print(f"⚠️ BUY_STOP {price} too close to Ask {tick.ask}. Adjusting...")
+                price = round(tick.ask + min_dist, digits)
 
-        if req.tp is not None:
-            tp = round(req.tp, digits)
-            if req.action == "BUY":
-                if tp <= price:
-                    tp = round(price + abs(price - tp) + min_stop_price, digits)
-                if (tp - price) < min_stop_price:
-                    tp = round(price + min_stop_price, digits)
-            else:  # SELL
-                if tp >= price:
-                    tp = round(price - abs(price - tp) - min_stop_price, digits)
-                if (price - tp) < min_stop_price:
-                    tp = round(price - min_stop_price, digits)
-        else:
-            tp = None
+        elif req.action == "SELL_LIMIT":
+            if price <= tick.bid + min_dist:
+                print(f"⚠️ SELL_LIMIT {price} too close to Bid {tick.bid}. Adjusting...")
+                price = round(tick.bid + min_dist, digits)
+
+        elif req.action == "SELL_STOP":
+            if price >= tick.bid - min_dist:
+                print(f"⚠️ SELL_STOP {price} too close to Bid {tick.bid}. Adjusting...")
+                price = round(tick.bid - min_dist, digits)
+
+    # Validate SL/TP for ALL order types
+    if req.sl is not None:
+        sl = round(req.sl, digits)
+        if "BUY" in req.action:
+            if sl >= price - min_dist:
+                sl = round(price - min_dist, digits)
+        else: # SELL
+            if sl <= price + min_dist:
+                sl = round(price + min_dist, digits)
     else:
-        sl = round(req.sl, digits) if req.sl is not None else None
-        tp = round(req.tp, digits) if req.tp is not None else None
+        sl = None
+
+    if req.tp is not None:
+        tp = round(req.tp, digits)
+        if "BUY" in req.action:
+            if tp <= price + min_dist:
+                tp = round(price + min_dist, digits)
+        else: # SELL
+            if tp >= price - min_dist:
+                tp = round(price - min_dist, digits)
+    else:
+        tp = None
 
     deviation = 20
 
@@ -654,9 +701,9 @@ def place_order(req: PlaceOrderRequest, token: Annotated[str, Depends(verify_tok
         "type_filling": ORDER_FILLING_IOC,
     }
 
-    if sl:
+    if sl is not None:
         request["sl"] = sl
-    if tp:
+    if tp is not None:
         request["tp"] = tp
 
     if not is_pending:
@@ -675,7 +722,9 @@ def place_order(req: PlaceOrderRequest, token: Annotated[str, Depends(verify_tok
         retcode = result.retcode if result else "None"
         comment = result.comment if result else "No response"
         error_msg = f"Order failed: retcode={retcode}, comment={comment}"
-        print(f"❌ {error_msg}")
+        
+        # If it still fails with Invalid Price, try to log what was sent
+        print(f"❌ {error_msg} | Sent: {req.action} @ {price} SL:{sl} TP:{tp}")
         raise HTTPException(status_code=400, detail=error_msg)
 
     print(f"✅ Order placed: {req.action} {volume} {symbol} @ {price} | Ticket: {result.order} | SL: {sl} | TP: {tp}")
@@ -836,6 +885,45 @@ def get_open_orders(token: Annotated[str, Depends(verify_token)]):
         "success": True,
         "count": len(position_list),
         "positions": position_list,
+    }
+
+
+@app.get("/orders/pending")
+def get_pending_orders(token: Annotated[str, Depends(verify_token)]):
+    """List all pending orders (Limit/Stop)."""
+    if not provider.initialized:
+        raise HTTPException(status_code=400, detail="MT5 not initialized")
+
+    orders = mt5.orders_get()
+    if orders is None:
+        return {"success": True, "count": 0, "orders": []}
+
+    order_list = []
+    for ord in orders:
+        order_list.append({
+            "ticket": ord.ticket,
+            "symbol": ord.symbol,
+            "type": {
+                mt5.ORDER_TYPE_BUY_LIMIT: "BUY_LIMIT",
+                mt5.ORDER_TYPE_SELL_LIMIT: "SELL_LIMIT",
+                mt5.ORDER_TYPE_BUY_STOP: "BUY_STOP",
+                mt5.ORDER_TYPE_SELL_STOP: "SELL_STOP",
+                mt5.ORDER_TYPE_BUY_STOP_LIMIT: "BUY_STOP_LIMIT",
+                mt5.ORDER_TYPE_SELL_STOP_LIMIT: "SELL_STOP_LIMIT",
+            }.get(ord.type, f"OTHER({ord.type})"),
+            "volume": ord.volume_current,
+            "price": ord.price_open,
+            "sl": ord.sl,
+            "tp": ord.tp,
+            "magic": ord.magic,
+            "comment": ord.comment,
+            "time": ord.time_setup.strftime("%Y-%m-%d %H:%M:%S") if hasattr(ord.time_setup, 'strftime') else str(ord.time_setup),
+        })
+
+    return {
+        "success": True,
+        "count": len(order_list),
+        "orders": order_list,
     }
 
 
